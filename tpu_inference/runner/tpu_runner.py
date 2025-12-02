@@ -500,6 +500,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                             dtype=np.int64)
 
     def load_model(self):
+        # YYY
         self.model_fn, self.compute_logits_fn, self.combine_hidden_states_fn, multimodal_fns, self.state, self.lora_manager, self.model = get_model(
             self.vllm_config,
             self.rng_key,
@@ -726,12 +727,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             and self.model_config.hf_config.architectures[0]
             == "Llama4ForConditionalGeneration")
 
+        # YYY
         # multi-modal support
         if self.is_multimodal_model:
             # Run the multimodal encoder if any.
             # We have the modality embeds at this time.
             self.mm_manager.execute_mm_encoder(scheduler_output)
-            mm_embeds = self.mm_manager.gather_mm_embeddings(
+            mm_embeds, is_mm_embed = self.mm_manager.gather_mm_embeddings(
                 scheduler_output, input_ids.shape[0])
         #TODO: Remove the follow elif statement once Llama Guard 4 Vision portion has been implemented
         elif is_llama_guard_4 and any(
@@ -748,8 +750,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Later, the multi-modality model will take the embedding as the input.
         # For text-only model, this does nothing. It will input the input_ids and
         # leave the mebedding job inside the forward pass
+        # YYY
         input_ids, inputs_embeds = self._get_input_ids_embeds(
-            input_ids, mm_embeds)
+            input_ids, mm_embeds, is_mm_embed)
 
         lora_metadata = self.lora_utils.extract_lora_metadata()
         # TODO: make _get_input_ids_embeds within this context
@@ -1662,12 +1665,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 padded_num_reqs)
 
     def _get_input_ids_embeds(self, input_ids: jax.Array,
-                              mm_embeds: list[jax.Array]):
+                              mm_embeds: list[jax.Array],
+                              is_mm_embed,):
         if self.is_multimodal_model:
             inputs_embeds = self.get_input_embeddings_fn(
                 self.state,
                 input_ids,
                 mm_embeds,
+                is_multimodal=is_mm_embed
             )
             return None, inputs_embeds
         else:

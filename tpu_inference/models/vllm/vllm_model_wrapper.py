@@ -2,7 +2,7 @@ import copy
 import functools
 from collections.abc import Sequence
 from contextlib import nullcontext
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, TypeAlias
 from unittest.mock import patch
 
 import jax
@@ -34,6 +34,8 @@ from tpu_inference.runner.lora_utils import replace_lora_metadata
 
 logger = init_logger(__name__)
 
+# the same definition in vllm
+MultiModalEmbeddings: TypeAlias = list[torch.Tensor] | torch.Tensor | tuple[torch.Tensor, ...]
 
 class _VllmRunner(torch.nn.Module):
 
@@ -44,13 +46,23 @@ class _VllmRunner(torch.nn.Module):
     def forward(self, **kwargs) -> torch.Tensor:
         if "hidden_state" in kwargs:
             return self.compute_logits(kwargs["hidden_state"])
-        else:
+        elif "is_multimodal" in kwargs:
+            return self.vllm_model.embed_input_ids(
+                kwargs["input_ids"],
+                kwargs["multimodal_embeddings"],
+                is_multimodal=kwargs["is_multimodal"],
+                handle_oov_mm_token=kwargs["handle_oov_mm_token"],
+            )
+        elif "input_ids" in kwargs:
             return self.compute_hidden_state(
                 kwargs["input_ids"],
                 kwargs["positions"],
                 kwargs["intermediate_tensors"],
                 kwargs["inputs_embeds"],
             )
+        else:
+            return self.vllm_model.embed_multimodal(**kwargs)
+            
 
     def compute_hidden_state(
         self,
@@ -197,8 +209,8 @@ class VllmModelWrapper:
                     kwargs={
                         "input_ids": torch_view(input_ids),
                         "positions": torch_view(input_positions),
-                        "intermediate_tensors": None,
-                        "inputs_embeds": None,
+                        "intermediate_tensors": torch_view(intermediate_tensors),
+                        "inputs_embeds": torch_view(input_embeds),
                     },
                     tie_weights=False,
                 )
@@ -246,6 +258,67 @@ class VllmModelWrapper:
             return jax_view(logits)
 
         return compute_logits_func
+
+    # YYY: not all model support below
+    def jit_embed_multimodal_func(self):
+
+        # @functools.partial(
+        #     jax.jit,
+        #     # out_shardings=(NamedSharding(self.mesh,
+        #     #                              PartitionSpec(None, "model"))),
+
+        # )
+        def embed_multimodal_func(
+            params_and_buffers: Any,
+            dummy, ### TODO
+             **kwargs: object,
+        ) -> MultiModalEmbeddings:
+            with torchax.default_env(), set_vllm_model_wrapper_context(
+                    kv_caches=None, mesh=self.mesh):
+                multimodal_embeddings = torch.func.functional_call(
+                    self.model,
+                    torch_view(params_and_buffers),
+                    kwargs=torch_view(jax.tree.map(lambda x: x.to('jax') if isinstance(x, torch.Tensor) else x, kwargs)),
+                    tie_weights=False,
+                )
+            return jax_view(multimodal_embeddings)
+
+        return embed_multimodal_func
+
+    def jit_embed_input_ids_func(self):
+
+        # @functools.partial(
+        #     jax.jit,
+        #     # out_shardings=(NamedSharding(self.mesh,
+        #     #                              PartitionSpec(None, "model"))),
+        # )
+        def embed_input_ids_func(
+            params_and_buffers: Any,
+            input_ids: torch.Tensor,
+            multimodal_embeddings: MultiModalEmbeddings | None = None,
+            *,
+            is_multimodal: torch.Tensor | None = None,
+            handle_oov_mm_token: bool = False,
+        ) -> torch.Tensor:
+            with torchax.default_env(), set_vllm_model_wrapper_context(
+                kv_caches=None, mesh=self.mesh
+            ):
+                inputs_embeds = torch.func.functional_call(
+                    self.model,
+                    torch_view(params_and_buffers),
+                    kwargs=torch_view(
+                        {
+                            "input_ids": torch_view(input_ids),
+                            "multimodal_embeddings": torch_view(multimodal_embeddings),
+                            "is_multimodal": torch_view(is_multimodal),
+                            "handle_oov_mm_token": torch_view(handle_oov_mm_token),
+                        }
+                    ),
+                    tie_weights=False,
+                )
+            return jax_view(inputs_embeds)
+
+        return embed_input_ids_func
 
 
 def load_lora_model(model: torch.nn.Module, vllm_config: VllmConfig,

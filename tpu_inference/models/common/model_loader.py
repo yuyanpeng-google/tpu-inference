@@ -306,7 +306,7 @@ def get_flax_model(
 
     return model_fn, compute_logits_fn, combine_hidden_states_fn, multimodal_fns, state, lora_manager, model
 
-
+# YYY: mutli-modal fn
 def get_vllm_model(
     vllm_config: VllmConfig,
     rng: jax.Array,
@@ -325,7 +325,20 @@ def get_vllm_model(
     compute_logits_fn = model.jit_compute_logits_func()
     # the model needs to be returned because lora weights are neither torch.nn.parameter nor torch.nn.buffer. After we load the lora weights and set it to the torch.nn.Module, we can shard it and move it to TPU.
     combine_hidden_states_fn = None
-    return jit_model, compute_logits_fn, combine_hidden_states_fn, None, params, lora_manager, model
+
+    precompile_vision_encoder_fn = getattr(model, "precompile_vision_encoder",
+                                           None)
+    get_multimodal_embeddings_fn = model.jit_embed_multimodal_func()
+    get_input_embeddings_fn = model.jit_embed_input_ids_func()
+
+    multimodal_fns = {
+        "precompile_vision_encoder_fn": precompile_vision_encoder_fn,
+        "get_multimodal_embeddings_fn": get_multimodal_embeddings_fn,
+        "get_input_embeddings_fn": get_input_embeddings_fn,
+        "get_mrope_input_positions_fn": None,
+    }
+
+    return jit_model, compute_logits_fn, combine_hidden_states_fn, multimodal_fns, params, lora_manager, model
 
 
 def get_model(

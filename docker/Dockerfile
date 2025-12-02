@@ -1,7 +1,10 @@
 ARG NIGHTLY_DATE="20250714"
 ARG BASE_IMAGE="us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/xla:nightly_3.12_tpuvm_$NIGHTLY_DATE"
 # The latest main will be used if arg unspecified
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_COMMIT_HASH=""
+ARG TORCHAX_REPO=https://github.com/google/torchax.git
+ARG TORCHAX_COMMIT_HASH
 
 FROM $BASE_IMAGE
 
@@ -21,6 +24,7 @@ ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_COMMIT_HASH
 RUN git clone $VLLM_REPO /workspace/vllm
 RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
+        git fetch origin $VLLM_COMMIT_HASH;    \
         git checkout $VLLM_COMMIT_HASH; \
     fi
 RUN pip install -r requirements/tpu.txt --retries 3
@@ -53,5 +57,16 @@ COPY requirements_v7x.txt .
 RUN if [ "$IS_FOR_V7X" = "true" ]; then \
         pip install -r requirements_v7x.txt; \
     fi
+
+# Overwrite torchax for missing ops
+WORKDIR /workspace/torchax
+ARG TORCHAX_REPO=https://github.com/google/torchax.git
+ARG TORCHAX_COMMIT_HASH
+RUN git clone $TORCHAX_REPO /workspace/torchax
+RUN if [ -n "$TORCHAX_COMMIT_HASH" ]; then \
+        git fetch origin $TORCHAX_COMMIT_HASH;    \
+        git checkout $TORCHAX_COMMIT_HASH; \
+    fi
+RUN pip install -e .
 
 CMD ["/bin/bash"]
