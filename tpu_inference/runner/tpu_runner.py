@@ -749,7 +749,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.mm_manager.execute_mm_encoder(scheduler_output)
             mm_embeds = self.mm_manager.gather_mm_embeddings(
                 scheduler_output, input_ids.shape[0])
-        #TODO: Remove the follow elif statement once Llama Guard 4 Vision portion has been implemented
+        # TODO: Remove the follow elif statement once Llama Guard 4 Vision portion has been implemented
         elif is_llama_guard_4 and any(
                 self.mm_manager.runner.requests[req_id].mm_features
                 for req_id in self.mm_manager.runner.input_batch.req_ids):
@@ -800,16 +800,27 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 return attn_metadata, hidden_states
 
             if self.is_pooling_model:
-                seq_lens = self.seq_lens_cpu[:self.input_batch.num_reqs]
+                # seq_len in metadata will pad 1 for padded reqs
                 pooling_metadata = self.input_batch.get_pooling_metadata()
-
-                pooler_fn: PoolerFunc = self.pooler_fn
-                pooler_output = pooler_fn(
-                    hidden_states,
-                    pooling_metadata,
+                seq_lens = self.seq_lens_cpu[:self.input_batch.num_reqs]
+                seq_lens = np.pad(
                     seq_lens,
+                    ((0, self.max_num_reqs - self.input_batch.num_reqs),),
+                    constant_values=1,
                 )
 
+                padded_pooler_output = self._compute_pooler_output(
+                    hidden_states, pooling_metadata, seq_lens
+                )
+                pooler_output = padded_pooler_output[:self.input_batch.num_reqs]
+
+                # pooler_output is list[torch.Tensor]. Workaround here.
+                import torchax
+                from torchax.interop import torch_view
+                with torchax.default_env():
+                    pooler_output = [
+                        t.to("cpu", non_blocking=True) for t in torch_view(pooler_output)
+                    ]
                 return None, ModelRunnerOutput(
                     req_ids=self.input_batch.req_ids,
                     req_id_to_index=self.input_batch.req_id_to_index,
@@ -839,6 +850,35 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logits_indices_selector=logits_indices_selector,
             padded_num_reqs=padded_num_reqs)
         return attn_metadata, None
+
+    # @functools.partial(jax.jit, static_argnums=(0, ))
+    def _compute_pooler_output(
+        self,
+        hidden_states: jax.Array,
+        pooling_metadata: Any, # TODO: handle type
+        seq_lens: np.ndarray,
+    ):
+        # hidden_states shape: [max_batched_tokens, hidden_dims]
+        # Pad hidden states to prevent out of bound cursor by padded reqs
+        # TODO: use bucket requests nums
+        padded_hidden_states = jnp.pad(
+            hidden_states,
+            (
+                (0, self.max_num_reqs),
+                (0, 0),
+            ),
+            constant_values=0,
+        )
+
+        pooler_fn: PoolerFunc = self.pooler_fn
+        padded_pooler_output = pooler_fn(
+            padded_hidden_states,
+            pooling_metadata,
+            seq_lens,
+        )
+
+        assert isinstance(padded_pooler_output, tuple)
+        return padded_pooler_output
 
     def _sample_from_logits(
         self,

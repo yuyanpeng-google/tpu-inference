@@ -494,12 +494,27 @@ class CompilationManager:
 
     def _precompile_compute_pooling(self) -> None:
         logger.info("Compiling compute_pooling with different input shapes.")
-
-        # vLLM pooling layer design has complex and dynamic logic. There are
-        # interoperate between tensors from host and accelerator.
-        # It's quite hard, if not impossible, to move all tensor to accelerator
-        # and apply JIT on the entire computation.
-        # See PoolingCursor and AllPool, MeanPool ... in vLLM repo for details.
+        hsize = self.runner.model_config.get_hidden_size()
+        dp_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA)
+        )
+        for num_tokens in self.runner.num_tokens_paddings:
+            padded_hidden_states = self._create_dummy_tensor(
+                (num_tokens, hsize),
+                jnp.bfloat16,
+                dp_sharding,
+            )
+            pooling_metadata = self.runner.input_batch.get_pooling_metadata()
+            seq_lens = np.ones(self.runner.max_num_reqs, dtype=np.int32)
+            # TODO: prevent complicated args for the precompiled function
+            self._run_compilation(
+                f"worker{self.runner.rank} compute pooling",
+                self.runner._compute_pooler_output,
+                padded_hidden_states,
+                pooling_metadata,
+                seq_lens,
+                num_tokens=num_tokens,
+            )
 
     def _precompile_sampling(self) -> None:
         logger.info("Compiling sampling with different input shapes.")

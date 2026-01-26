@@ -156,15 +156,36 @@ class InputBatch:
         pooling_params = self.get_pooling_params()
         pooling_states = self.get_pooling_states()
 
+        # TODO: The logic break the assertion seq len <= cusum(seq_len)
+        # Pad for fewer buckets to prevent re-compiling in most of models.
+        # Pad seq len one for the padded requests to prevent mean pool divided
+        # by zero.
+        padded_seq_len = np.pad(
+            self.num_prompt_tokens[: self.num_reqs],
+            ((0, self.max_num_reqs - self.num_reqs),),
+            constant_values=1,
+        )
+
+        # Assume params and states would not change among requests.
+        # If the model change the params or states, it may produce
+        # wrong results or repeatedly re-compile.
+        # TODO: the params affect the calculation flow inside the pooler.
+        #       It may not correctly precompile all ops.
+        padded_pooling_params = pooling_params + [
+            pooling_params[0] if pooling_params else PoolingParams(task="embed")
+        ] * (self.max_num_reqs - self.num_reqs)
+        padded_pooling_states = pooling_states + [PoolingStates()] * (
+            self.max_num_reqs - self.num_reqs
+        )
+
         # Prompt token ID is used by StepPooler.
         # As embedding task for converted model is not implemented yet,
         # so it's ok to set prompt token ID list to None here.
         return PoolingMetadata(
-            prompt_lens=torch.from_numpy(
-                self.num_prompt_tokens[:self.num_reqs]),
+            prompt_lens=torch.from_numpy(padded_seq_len),
             prompt_token_ids=None,
-            pooling_params=pooling_params,
-            pooling_states=pooling_states,
+            pooling_params=padded_pooling_params,
+            pooling_states=padded_pooling_states,
         )
 
     def add_request(
