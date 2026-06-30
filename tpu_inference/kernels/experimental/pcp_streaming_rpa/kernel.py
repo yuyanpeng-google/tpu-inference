@@ -113,13 +113,28 @@ def _consume_scheduled_kv_page_multi_head(
     slot,
     consumer_rank,
     lane,
-    m_states,
-    l_states,
-    acc_states,
+    l_ref,
+    m_ref,
+    acc_ref,
     *,
     sm_scale,
     pcp_size,
 ):
+    """Consumes a scheduled KV page block across all multi-heads in-place.
+
+    Args:
+        q_vmem_ref: VMEM reference of local query states.
+        kv_vmem_ref: VMEM reference of local key/value cache block.
+        sched_vmem_ref: VMEM reference of local step schedule.
+        slot: Slot index in the double-buffered KV cache block.
+        consumer_rank: Current PCP rank of the calling device.
+        lane: Active schedule lane index.
+        l_ref: VMEM reference to scratch buffer representing flash attention denominator 'l'.
+        m_ref: VMEM reference to scratch buffer representing flash attention max score 'm'.
+        acc_ref: VMEM reference to scratch buffer representing accumulated output 'acc'.
+        sm_scale: Softmax scale factor.
+        pcp_size: Physical device ring/topology size.
+    """
     q = q_vmem_ref[...].astype(jnp.float32)
 
     q_global_start = sched_vmem_ref[consumer_rank, lane,
@@ -135,9 +150,6 @@ def _consume_scheduled_kv_page_multi_head(
     flat_q_rows = q_vmem_ref.shape[0] * q_per_kv
     page_size = kv_vmem_ref.shape[2]
     kv_block_tokens = kv_vmem_ref.shape[1] * page_size
-    next_m_states = []
-    next_l_states = []
-    next_acc_states = []
 
     for kv_head_idx in range(q_vmem_ref.shape[1]):
         q_head = q[:, kv_head_idx, :, :].reshape(flat_q_rows,
@@ -149,10 +161,13 @@ def _consume_scheduled_kv_page_multi_head(
         k = k.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
         v = v.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
 
-        m_head = m_states[kv_head_idx].reshape(flat_q_rows, 1)
-        l_head = l_states[kv_head_idx].reshape(flat_q_rows, 1)
-        head_dim = acc_states[kv_head_idx].shape[-1]
-        acc_head = acc_states[kv_head_idx].reshape(flat_q_rows, head_dim)
+        m_head_ref = m_ref.at[kv_head_idx]
+        l_head_ref = l_ref.at[kv_head_idx]
+        acc_head_ref = acc_ref.at[kv_head_idx]
+
+        m_prev = m_head_ref[...]
+        l_prev = l_head_ref[...]
+        acc_prev = acc_head_ref[...]
 
         scores = (jnp.matmul(q_head, k.T, preferred_element_type=jnp.float32) *
                   sm_scale)
@@ -180,23 +195,18 @@ def _consume_scheduled_kv_page_multi_head(
         scores = jnp.where(row_active, scores, 0.0)
 
         m_curr = jnp.max(scores, axis=1, keepdims=True)
-        m_next = jnp.where(row_active, jnp.maximum(m_head, m_curr), m_head)
+        m_next = jnp.where(row_active, jnp.maximum(m_prev, m_curr), m_prev)
         p = jnp.where(row_active,
-                      jnp.exp(scores - jnp.broadcast_to(m_next, scores.shape)),
+                      jnp.exp(scores - jnp.broadcast_to(m_next[..., :1], scores.shape)),
                       0.0)
-        alpha = jnp.where(row_active, jnp.exp(m_head - m_next), 1.0)
-        l_next = alpha * l_head + jnp.sum(p, axis=1, keepdims=True)
+        alpha = jnp.where(row_active, jnp.exp(m_prev - m_next), 1.0)
+        l_next = alpha * l_prev + jnp.sum(p, axis=1, keepdims=True)
         pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
-        acc_next = jnp.broadcast_to(alpha, acc_head.shape) * acc_head + pv
+        acc_next = jnp.broadcast_to(alpha[..., :1], acc_prev.shape) * acc_prev + pv
 
-        next_m_states.append(
-            m_next.reshape(q_vmem_ref.shape[0], q_per_kv, 1))
-        next_l_states.append(
-            l_next.reshape(q_vmem_ref.shape[0], q_per_kv, 1))
-        next_acc_states.append(
-            acc_next.reshape(q_vmem_ref.shape[0], q_per_kv, head_dim))
-
-    return tuple(next_m_states), tuple(next_l_states), tuple(next_acc_states)
+        m_head_ref[...] = m_next.astype(m_head_ref.dtype)
+        l_head_ref[...] = l_next.astype(l_head_ref.dtype)
+        acc_head_ref[...] = acc_next.astype(acc_head_ref.dtype)
 
 
 def _load_schedule_step(packed_schedule_ref, sched_vmem_ref, sem, step):
@@ -498,6 +508,9 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
     q_vmem_ref,
     kv_vmem_ref,
     o_vmem_ref,
+    l_ref,
+    m_ref,
+    acc_ref,
     *,
     pcp_size,
     num_lanes,
@@ -511,6 +524,37 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
     mesh_axis_names,
     pcp_axis_name,
 ):
+    """Pallas kernel for multi-head PCP streaming page groups.
+
+    Args:
+        active_page_groups_ref: HBM reference of the active page group count.
+        q_ref: HBM reference of queries.
+        kv_cache_ref: HBM reference of local key/value cache.
+        packed_schedule_ref: HBM reference of step schedules.
+        o_ref: HBM reference of output attention.
+        sched_dma_sem: DMA semaphore for loading schedule.
+        local_dma_sem: DMA semaphore for local transfers.
+        remote_send_sems: DMA semaphores for remote sends.
+        remote_recv_sems: DMA semaphores for remote receives.
+        sched_vmem_ref: VMEM reference for step schedules.
+        q_vmem_ref: VMEM reference for query tiles.
+        kv_vmem_ref: VMEM reference for key/value cache tiles.
+        o_vmem_ref: VMEM reference for output tiles.
+        l_ref: VMEM reference to scratch buffer for flash attention 'l'.
+        m_ref: VMEM reference to scratch buffer for flash attention 'm'.
+        acc_ref: VMEM reference to scratch buffer for flash attention accumulated output.
+        pcp_size: Physical device ring/topology size.
+        num_lanes: Number of lanes.
+        q_block_size: Size of a query tile.
+        num_page_groups: Total number of page groups.
+        num_q_blocks: Number of query blocks.
+        sm_scale: Softmax scale factor.
+        kv_heads: Number of local key/value heads.
+        kv_packing: Pack count for key/value.
+        kv_pages_per_block: Number of pages in each cache block.
+        mesh_axis_names: Names of mesh axis.
+        pcp_axis_name: Name of the PCP axis.
+    """
     my_id = lax.axis_index(pcp_axis_name)
     next_rank = lax.rem(my_id + 1, pcp_size)
     prev_rank = lax.rem(my_id + pcp_size - 1, pcp_size)
@@ -518,19 +562,11 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
     prev_device_id = _mesh_device_id(mesh_axis_names, pcp_axis_name, prev_rank)
 
     for lane in range(num_lanes):
-        m_states = tuple(
-            jnp.full((q_block_size, q_vmem_ref.shape[2], 1),
-                     -jnp.inf,
-                     dtype=jnp.float32) for _ in range(kv_heads))
-        l_states = tuple(
-            jnp.zeros((q_block_size, q_vmem_ref.shape[2], 1),
-                      dtype=jnp.float32) for _ in range(kv_heads))
-        acc_states = tuple(
-            jnp.zeros((q_block_size, q_vmem_ref.shape[2], q_vmem_ref.shape[3]),
-                      dtype=jnp.float32) for _ in range(kv_heads))
+        l_ref[...] = jnp.zeros_like(l_ref)
+        m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+        acc_ref[...] = jnp.zeros_like(acc_ref)
 
         def _page_group_loop(group_idx, carry):
-            m_states, l_states, acc_states = carry
             group_start = group_idx * pcp_size
 
             _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
@@ -578,19 +614,16 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
 
             util.local_barrier(prev_device_id, next_device_id)
 
-            m_states = tuple(
-                jnp.where(group_is_first_kv, jnp.full_like(m, -jnp.inf), m)
-                for m in m_states)
-            l_states = tuple(
-                jnp.where(group_is_first_kv, jnp.zeros_like(l), l)
-                for l in l_states)
-            acc_states = tuple(
-                jnp.where(group_is_first_kv, jnp.zeros_like(acc), acc)
-                for acc in acc_states)
+            @pl.when(group_is_first_kv)
+            def _reset_states():
+                l_ref[...] = jnp.zeros_like(l_ref)
+                m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+                acc_ref[...] = jnp.zeros_like(acc_ref)
+
             group_has_last = jnp.array(False)
 
             def _pcp_loop_body(round_idx, carry):
-                m_states, l_states, acc_states, group_has_last = carry
+                group_has_last = carry
                 curr_slot = round_idx % 2
                 next_slot = 1 - curr_slot
                 src_rank = lax.rem(my_id + pcp_size - round_idx, pcp_size)
@@ -617,20 +650,19 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
                     )
                     remote_op.start()
 
-                m_states, l_states, acc_states = (
-                    _consume_scheduled_kv_page_multi_head(
-                        q_vmem_ref,
-                        kv_vmem_ref,
-                        sched_vmem_ref,
-                        curr_slot,
-                        my_id,
-                        lane,
-                        m_states,
-                        l_states,
-                        acc_states,
-                        sm_scale=sm_scale,
-                        pcp_size=pcp_size,
-                    ))
+                _consume_scheduled_kv_page_multi_head(
+                    q_vmem_ref,
+                    kv_vmem_ref,
+                    sched_vmem_ref,
+                    curr_slot,
+                    my_id,
+                    lane,
+                    l_ref,
+                    m_ref,
+                    acc_ref,
+                    sm_scale=sm_scale,
+                    pcp_size=pcp_size,
+                )
 
                 @pl.when(round_idx < pcp_size - 1)
                 def _remote_copy_wait():
@@ -645,19 +677,25 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
                     remote_op.wait()
                     util.local_barrier(prev_device_id, next_device_id)
 
-                return (m_states, l_states, acc_states, group_has_last)
+                return group_has_last
 
-            # unroll cause spill
-            m_states, l_states, acc_states, group_has_last = lax.fori_loop(
+            group_has_last = lax.fori_loop(
                 0,
                 pcp_size,
                 _pcp_loop_body,
-                init_val=(m_states, l_states, acc_states, group_has_last),
+                init_val=group_has_last,
                 unroll=False,
             )
 
-            l = jnp.stack(l_states, axis=1)
-            acc = jnp.stack(acc_states, axis=1)
+            q_per_kv = q_vmem_ref.shape[2]
+            head_dim = q_vmem_ref.shape[3]
+            acc = acc_ref[...].reshape(kv_heads, q_block_size, q_per_kv, head_dim)
+            acc = jnp.swapaxes(acc, 0, 1)
+
+            l = l_ref[..., 0].reshape(kv_heads, q_block_size, q_per_kv)
+            l = jnp.swapaxes(l, 0, 1)
+            l = l[..., None]
+
             l_broadcast = jnp.broadcast_to(l, acc.shape)
             o_vmem_ref[...] = jnp.where(l_broadcast > 0, acc / l_broadcast,
                                         0.0).astype(o_vmem_ref.dtype)
@@ -679,15 +717,15 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
                 o_store.start()
                 o_store.wait()
 
-            return m_states, l_states, acc_states
+            return carry
 
         active_page_groups = jnp.minimum(active_page_groups_ref[0],
                                          num_page_groups)
-        m_states, l_states, acc_states = lax.fori_loop(
+        lax.fori_loop(
             0,
             active_page_groups,
             _page_group_loop,
-            (m_states, l_states, acc_states),
+            0,
             unroll=False,
         )
 
@@ -953,6 +991,22 @@ def _pcp_streaming_attention_page_groups_multi_head_pallas_call(
     mesh_axis_names: tuple[str, ...] = (AXIS, ),
     pcp_axis_name: str = AXIS,
 ):
+    """Pallas call wrapper for multi-head PCP streaming page groups.
+
+    Args:
+        q_multi_head: Query states.
+        kv_cache_local: Local key/value cache block.
+        packed_schedule: Packed schedules.
+        active_page_groups: Optional list of active page group counts.
+        pcp_size: Physical device ring/topology size.
+        q_block_size: Size of a query tile.
+        sm_scale: Softmax scale factor.
+        collective_id: Optional collective operation ID.
+        kv_packing: Pack count for key/value cache.
+        kv_pages_per_block: Number of pages per cache block.
+        mesh_axis_names: Names of mesh axis.
+        pcp_axis_name: Name of the PCP axis.
+    """
     page_size = kv_cache_local.shape[2]
     kv_heads = q_multi_head.shape[1]
     q_per_kv = q_multi_head.shape[2]
@@ -966,6 +1020,22 @@ def _pcp_streaming_attention_page_groups_multi_head_pallas_call(
         active_page_groups = jnp.asarray(active_page_groups, dtype=jnp.int32)
         if active_page_groups.shape == ():
             active_page_groups = active_page_groups[None]
+
+    actual_num_kv_heads = kv_heads
+    bq_sz = q_block_size
+    num_q_heads_per_kv_head = q_per_kv
+    out_dtype = q_multi_head.dtype
+
+    l_scratch = pltpu.VMEM(
+        (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
+        out_dtype,
+    )
+    m_scratch = l_scratch
+
+    acc_scratch = pltpu.VMEM(
+        (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
+        out_dtype,
+    )
 
     return pl.pallas_call(
         functools.partial(
@@ -1009,6 +1079,9 @@ def _pcp_streaming_attention_page_groups_multi_head_pallas_call(
                            kv_cache_local.dtype),
                 pltpu.VMEM((q_block_size, kv_heads, q_per_kv, head_dim),
                            q_multi_head.dtype),
+                l_scratch,
+                m_scratch,
+                acc_scratch,
             ),
             grid=(1, ),
         ),
