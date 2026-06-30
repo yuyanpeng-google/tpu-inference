@@ -119,8 +119,10 @@ def _consume_scheduled_kv_page_multi_head(
     *,
     sm_scale,
     pcp_size,
+    q_compute_size: int,
+    kv_compute_size: int,
 ):
-    """Consumes a scheduled KV page block across all multi-heads in-place.
+    """Consumes a scheduled KV page block across all multi-heads in-place with query and KV tiling.
 
     Args:
         q_vmem_ref: VMEM reference of local query states.
@@ -134,6 +136,8 @@ def _consume_scheduled_kv_page_multi_head(
         acc_ref: VMEM reference to scratch buffer representing accumulated output 'acc'.
         sm_scale: Softmax scale factor.
         pcp_size: Physical device ring/topology size.
+        q_compute_size: The chunk size for tiling queries (default: 512).
+        kv_compute_size: The chunk size for tiling keys and values (default: 512).
     """
     q = q_vmem_ref[...].astype(jnp.float32)
 
@@ -151,62 +155,89 @@ def _consume_scheduled_kv_page_multi_head(
     page_size = kv_vmem_ref.shape[2]
     kv_block_tokens = kv_vmem_ref.shape[1] * page_size
 
+    q_chunk_size = min(q_compute_size, flat_q_rows)
+    kv_chunk_size = min(kv_compute_size, kv_block_tokens)
+
+    assert (flat_q_rows % q_chunk_size) == 0
+    assert (kv_block_tokens % kv_chunk_size) == 0
+
     for kv_head_idx in range(q_vmem_ref.shape[1]):
-        q_head = q[:, kv_head_idx, :, :].reshape(flat_q_rows,
-                                                 q_vmem_ref.shape[-1])
-        k = kv_vmem_ref.at[slot, :, :, kv_head_idx, 0, :][...].astype(
+        q_head_full = q[:, kv_head_idx, :, :].reshape(flat_q_rows,
+                                                     q_vmem_ref.shape[-1])
+        k_full = kv_vmem_ref.at[slot, :, :, kv_head_idx, 0, :][...].astype(
             jnp.float32)
-        v = kv_vmem_ref.at[slot, :, :, kv_head_idx, 1, :][...].astype(
+        v_full = kv_vmem_ref.at[slot, :, :, kv_head_idx, 1, :][...].astype(
             jnp.float32)
-        k = k.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
-        v = v.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
+        k_full = k_full.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
+        v_full = v_full.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
 
         m_head_ref = m_ref.at[kv_head_idx]
         l_head_ref = l_ref.at[kv_head_idx]
         acc_head_ref = acc_ref.at[kv_head_idx]
 
-        m_prev = m_head_ref[...]
-        l_prev = l_head_ref[...]
-        acc_prev = acc_head_ref[...]
+        for q_start in range(0, flat_q_rows, q_chunk_size):
+            chunk_size = q_chunk_size
 
-        scores = (jnp.matmul(q_head, k.T, preferred_element_type=jnp.float32) *
-                  sm_scale)
-        q_row = lax.div(
-            lax.broadcasted_iota(jnp.int32, scores.shape, 0),
-            q_per_kv,
-        )
-        q_interleave = page_size
-        q_chunk_idx = lax.div(q_row, q_interleave)
-        q_chunk_offset = lax.rem(q_row, q_interleave)
-        q_pos = (q_global_start +
-                 q_chunk_idx * pcp_size * q_interleave + q_chunk_offset)
-        kv_local_pos = lax.broadcasted_iota(jnp.int32, scores.shape, 1)
-        kv_page_offset = lax.div(kv_local_pos, page_size)
-        kv_token_offset = lax.rem(kv_local_pos, page_size)
-        kv_pos = (kv_global_start +
-                  kv_page_offset * pcp_size * page_size + kv_token_offset)
-        kv_valid = kv_local_pos < kv_valid_len
-        q_valid = q_row < q_tile_size
-        entry_valid = req_id != -1
-        row_active = jnp.logical_and(entry_valid, q_valid[:, :1])
-        mask = jnp.logical_and(jnp.logical_and(q_pos >= kv_pos, kv_valid),
-                               q_valid)
-        scores = jnp.where(mask, scores, -jnp.inf)
-        scores = jnp.where(row_active, scores, 0.0)
+            q_head_chunk = q_head_full[q_start:q_start + chunk_size]
 
-        m_curr = jnp.max(scores, axis=1, keepdims=True)
-        m_next = jnp.where(row_active, jnp.maximum(m_prev, m_curr), m_prev)
-        p = jnp.where(row_active,
-                      jnp.exp(scores - jnp.broadcast_to(m_next[..., :1], scores.shape)),
-                      0.0)
-        alpha = jnp.where(row_active, jnp.exp(m_prev - m_next), 1.0)
-        l_next = alpha * l_prev + jnp.sum(p, axis=1, keepdims=True)
-        pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
-        acc_next = jnp.broadcast_to(alpha[..., :1], acc_prev.shape) * acc_prev + pv
+            m_chunk_ref = m_head_ref.at[q_start:q_start + chunk_size]
+            l_chunk_ref = l_head_ref.at[q_start:q_start + chunk_size]
+            acc_chunk_ref = acc_head_ref.at[q_start:q_start + chunk_size]
 
-        m_head_ref[...] = m_next.astype(m_head_ref.dtype)
-        l_head_ref[...] = l_next.astype(l_head_ref.dtype)
-        acc_head_ref[...] = acc_next.astype(acc_head_ref.dtype)
+            m_prev = m_chunk_ref[...]
+            l_prev = l_chunk_ref[...]
+            acc_prev = acc_chunk_ref[...]
+
+            m_curr_accum = m_prev
+            l_curr_accum = l_prev
+            acc_curr_accum = acc_prev
+
+            for kv_start in range(0, kv_block_tokens, kv_chunk_size):
+                k_chunk = k_full[kv_start : kv_start + kv_chunk_size]
+                v_chunk = v_full[kv_start : kv_start + kv_chunk_size]
+
+                scores = (jnp.matmul(q_head_chunk, k_chunk.T, preferred_element_type=jnp.float32) *
+                          sm_scale)
+                q_row_idx = q_start + lax.broadcasted_iota(jnp.int32, scores.shape, 0)
+                q_token_idx = lax.div(q_row_idx, q_per_kv)
+                q_interleave = page_size
+                q_chunk_idx = lax.div(q_token_idx, q_interleave)
+                q_chunk_offset = lax.rem(q_token_idx, q_interleave)
+                q_pos = (q_global_start +
+                         q_chunk_idx * pcp_size * q_interleave + q_chunk_offset)
+                
+                kv_local_pos = kv_start + lax.broadcasted_iota(jnp.int32, scores.shape, 1)
+                kv_page_offset = lax.div(kv_local_pos, page_size)
+                kv_token_offset = lax.rem(kv_local_pos, page_size)
+                kv_pos = (kv_global_start +
+                          kv_page_offset * pcp_size * page_size + kv_token_offset)
+                
+                kv_valid = kv_local_pos < kv_valid_len
+                q_valid = q_token_idx < q_tile_size
+                entry_valid = req_id != -1
+                row_active = jnp.logical_and(entry_valid, q_valid[:, :1])
+                mask = jnp.logical_and(jnp.logical_and(q_pos >= kv_pos, kv_valid),
+                                       q_valid)
+                scores = jnp.where(mask, scores, -jnp.inf)
+                scores = jnp.where(row_active, scores, 0.0)
+
+                m_curr = jnp.max(scores, axis=1, keepdims=True)
+                m_next = jnp.where(row_active, jnp.maximum(m_curr_accum, m_curr), m_curr_accum)
+                p = jnp.where(row_active,
+                              jnp.exp(scores - jnp.broadcast_to(m_next[..., :1], scores.shape)),
+                              0.0)
+                alpha = jnp.where(row_active, jnp.exp(m_curr_accum - m_next), 1.0)
+                l_next = alpha * l_curr_accum + jnp.sum(p, axis=1, keepdims=True)
+                pv = jnp.matmul(p, v_chunk, preferred_element_type=jnp.float32)
+                acc_next = jnp.broadcast_to(alpha[..., :1], acc_curr_accum.shape) * acc_curr_accum + pv
+
+                m_curr_accum = m_next
+                l_curr_accum = l_next
+                acc_curr_accum = acc_next
+
+            m_chunk_ref[...] = m_curr_accum.astype(m_chunk_ref.dtype)
+            l_chunk_ref[...] = l_curr_accum.astype(l_chunk_ref.dtype)
+            acc_chunk_ref[...] = acc_curr_accum.astype(acc_chunk_ref.dtype)
 
 
 def _load_schedule_step(packed_schedule_ref, sched_vmem_ref, sem, step):
@@ -523,6 +554,8 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
     kv_pages_per_block,
     mesh_axis_names,
     pcp_axis_name,
+    q_compute_size,
+    kv_compute_size,
 ):
     """Pallas kernel for multi-head PCP streaming page groups.
 
@@ -662,6 +695,8 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
                     acc_ref,
                     sm_scale=sm_scale,
                     pcp_size=pcp_size,
+                    q_compute_size=q_compute_size,
+                    kv_compute_size=kv_compute_size,
                 )
 
                 @pl.when(round_idx < pcp_size - 1)
@@ -990,6 +1025,8 @@ def _pcp_streaming_attention_page_groups_multi_head_pallas_call(
     kv_pages_per_block: int = 1,
     mesh_axis_names: tuple[str, ...] = (AXIS, ),
     pcp_axis_name: str = AXIS,
+    q_compute_size: int,
+    kv_compute_size: int,
 ):
     """Pallas call wrapper for multi-head PCP streaming page groups.
 
@@ -1006,6 +1043,8 @@ def _pcp_streaming_attention_page_groups_multi_head_pallas_call(
         kv_pages_per_block: Number of pages per cache block.
         mesh_axis_names: Names of mesh axis.
         pcp_axis_name: Name of the PCP axis.
+        q_compute_size: The chunk size for tiling queries (default: 512).
+        kv_compute_size: The chunk size for tiling keys and values (default: 512).
     """
     page_size = kv_cache_local.shape[2]
     kv_heads = q_multi_head.shape[1]
@@ -1051,6 +1090,8 @@ def _pcp_streaming_attention_page_groups_multi_head_pallas_call(
             kv_pages_per_block=kv_pages_per_block,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            q_compute_size=q_compute_size,
+            kv_compute_size=kv_compute_size,
         ),
         out_shape=jax.ShapeDtypeStruct(
             q_multi_head.shape,
@@ -1163,6 +1204,8 @@ def pcp_streaming_attention_page_groups_packed_local(
     kv_pages_per_block: int = 1,
     mesh_axis_names: tuple[str, ...] = (AXIS, ),
     pcp_axis_name: str = AXIS,
+    q_compute_size: int = 4096,
+    kv_compute_size: int = 512,
 ):
     """Run PCP streaming page groups on batched-RPA packed KV cache layout.
 
@@ -1195,6 +1238,8 @@ def pcp_streaming_attention_page_groups_packed_local(
             kv_pages_per_block=kv_pages_per_block,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            q_compute_size=q_compute_size,
+            kv_compute_size=kv_compute_size,
         )
 
     head_outputs = []
