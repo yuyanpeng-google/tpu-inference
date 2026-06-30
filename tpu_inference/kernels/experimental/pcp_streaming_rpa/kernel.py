@@ -589,12 +589,14 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
                 for acc in acc_states)
             group_has_last = jnp.array(False)
 
-            for round_idx in range(pcp_size):
+            def _pcp_loop_body(round_idx, carry):
+                m_states, l_states, acc_states, group_has_last = carry
                 curr_slot = round_idx % 2
                 next_slot = 1 - curr_slot
                 src_rank = lax.rem(my_id + pcp_size - round_idx, pcp_size)
 
-                if round_idx > 0:
+                @pl.when(round_idx > 0)
+                def _do_load_schedule():
                     _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
                                         sched_dma_sem, group_start + src_rank)
                 group_has_last = jnp.logical_or(
@@ -603,7 +605,8 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
                                    ScheduleField.IS_LAST_KV] != 0,
                 )
 
-                if round_idx < pcp_size - 1:
+                @pl.when(round_idx < pcp_size - 1)
+                def _remote_copy_start():
                     remote_op = pltpu.make_async_remote_copy(
                         src_ref=kv_vmem_ref.at[curr_slot],
                         dst_ref=kv_vmem_ref.at[next_slot],
@@ -629,9 +632,29 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
                         pcp_size=pcp_size,
                     ))
 
-                if round_idx < pcp_size - 1:
+                @pl.when(round_idx < pcp_size - 1)
+                def _remote_copy_wait():
+                    remote_op = pltpu.make_async_remote_copy(
+                        src_ref=kv_vmem_ref.at[curr_slot],
+                        dst_ref=kv_vmem_ref.at[next_slot],
+                        send_sem=remote_send_sems.at[lane, round_idx],
+                        recv_sem=remote_recv_sems.at[lane, round_idx],
+                        device_id=next_device_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
                     remote_op.wait()
                     util.local_barrier(prev_device_id, next_device_id)
+
+                return (m_states, l_states, acc_states, group_has_last)
+
+            # unroll cause spill
+            m_states, l_states, acc_states, group_has_last = lax.fori_loop(
+                0,
+                pcp_size,
+                _pcp_loop_body,
+                init_val=(m_states, l_states, acc_states, group_has_last),
+                unroll=False,
+            )
 
             l = jnp.stack(l_states, axis=1)
             acc = jnp.stack(acc_states, axis=1)
