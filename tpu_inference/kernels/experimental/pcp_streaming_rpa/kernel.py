@@ -169,6 +169,90 @@ def _consume_scheduled_kv_page_multi_head(
             vec = pltpu.bitcast(vec, dtype)
         return vec
 
+    def flash_attention_step1_qk_softmax(
+        q_head_chunk,
+        k_chunk,
+        v_chunk,
+        m_slice,
+        l_slice,
+        *,
+        q_start,
+        kv_start,
+    ):
+        """Computes query-key dot products, applies masks, and performs online softmax reduction in-place.
+
+        Args:
+            q_head_chunk: Current query chunk of shape (q_chunk_size, head_dim).
+            k_chunk: Current key chunk of shape (kv_chunk_size, head_dim).
+            v_chunk: Current value chunk of shape (kv_chunk_size, head_dim).
+            m_slice: VMEM reference slice for running maximum of attention scores.
+            l_slice: VMEM reference slice for running denominator for online softmax.
+            q_start: Global query start index within the chunk.
+            kv_start: Global key/value start index within the block.
+
+        Returns:
+            A tuple of (p, v_chunk, alpha) representing:
+            - p: Scaled attention probabilities of shape (q_chunk_size, kv_chunk_size).
+            - v_chunk: The current value chunk of shape (kv_chunk_size, head_dim).
+            - alpha: The scaling factor (exp(m_prev - m_next)) of shape (q_chunk_size, 1).
+        """
+        scores = lax.dot_general(
+            q_head_chunk,
+            k_chunk,
+            dimension_numbers=(([1], [1]), ([], [])),
+            preferred_element_type=jnp.float32,
+        )
+        q_row_idx = q_start + lax.broadcasted_iota(jnp.int32, scores.shape, 0)
+        q_token_idx = lax.div(q_row_idx, q_per_kv)
+        q_interleave = page_size
+        q_chunk_idx = lax.div(q_token_idx, q_interleave)
+        q_chunk_offset = lax.rem(q_token_idx, q_interleave)
+        q_pos = (q_global_start +
+                 q_chunk_idx * pcp_size * q_interleave + q_chunk_offset)
+        
+        kv_local_pos = kv_start + lax.broadcasted_iota(jnp.int32, scores.shape, 1)
+        kv_page_offset = lax.div(kv_local_pos, page_size)
+        kv_token_offset = lax.rem(kv_local_pos, page_size)
+        kv_pos = (kv_global_start +
+                  kv_page_offset * pcp_size * page_size + kv_token_offset)
+        
+        kv_valid = kv_local_pos < kv_valid_len
+        q_valid = q_token_idx < q_tile_size
+        entry_valid = req_id != -1
+        row_active = jnp.logical_and(entry_valid, q_valid[:, :1])
+        mask = jnp.logical_and(jnp.logical_and(q_pos >= kv_pos, kv_valid),
+                               q_valid)
+        scores = jnp.where(mask, scores, -jnp.inf)
+        scores = jnp.where(row_active, scores, 0.0)
+
+        m_curr = jnp.max(scores, axis=1, keepdims=True)
+        m_prev = m_slice[...]
+        m_next = jnp.where(row_active, jnp.maximum(m_prev, m_curr), m_prev)
+        m_slice[...] = m_next.astype(m_slice.dtype)
+
+        p = jnp.where(row_active,
+                      jnp.exp(scores - jnp.broadcast_to(m_next[..., :1], scores.shape)),
+                      0.0)
+        alpha = jnp.where(row_active, jnp.exp(m_prev - m_next), 1.0)
+        l_prev = l_slice[...]
+        l_next = alpha * l_prev + jnp.sum(p, axis=1, keepdims=True)
+        l_slice[...] = l_next.astype(l_slice.dtype)
+        return p, v_chunk, alpha
+
+    def flash_attention_step2_pv(p, v_chunk, alpha, acc_slice):
+        """Computes probabilities-values matrix multiplication and updates outputs in-place with scaling.
+
+        Args:
+            p: Attention probabilities of shape (q_chunk_size, kv_chunk_size).
+            v_chunk: Key/value value chunk of shape (kv_chunk_size, head_dim).
+            alpha: Scaling factor from online softmax step of shape (q_chunk_size, 1).
+            acc_slice: VMEM reference slice to accumulated attention output.
+        """
+        pv = jnp.matmul(p, v_chunk, preferred_element_type=jnp.float32)
+        acc_prev = acc_slice[...]
+        acc_next = jnp.broadcast_to(alpha[..., :1], acc_prev.shape) * acc_prev + pv
+        acc_slice[...] = acc_next.astype(acc_slice.dtype)
+
     q = q_vmem_ref[...]
 
     q_global_start = sched_vmem_ref[consumer_rank, lane,
@@ -185,6 +269,7 @@ def _consume_scheduled_kv_page_multi_head(
     page_size = kv_vmem_ref.shape[2]
     kv_block_tokens = kv_vmem_ref.shape[1] * page_size
 
+    # q_compute_size = 2048
     q_chunk_size = min(q_compute_size, flat_q_rows)
     kv_chunk_size = min(kv_compute_size, kv_block_tokens)
 
@@ -195,6 +280,11 @@ def _consume_scheduled_kv_page_multi_head(
     kv_heads = kv_vmem_ref.shape[3]
     kv_ref = kv_vmem_ref.at[slot].bitcast(jnp.uint32)
     kv_flat_ref = kv_ref.reshape(kv_block_tokens * kv_heads, head_dim)
+
+    prev_p = None
+    prev_v = None
+    prev_alpha = None
+    prev_acc_slice = None
 
     for kv_head_idx in range(q_vmem_ref.shape[1]):
         q_head_full = q[:, kv_head_idx, :, :].reshape(flat_q_rows,
@@ -212,79 +302,49 @@ def _consume_scheduled_kv_page_multi_head(
         k_full = k_full.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
         v_full = v_full.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
 
-        m_head_ref = m_ref.at[kv_head_idx]
-        l_head_ref = l_ref.at[kv_head_idx]
-        acc_head_ref = acc_ref.at[kv_head_idx]
-
         for q_start in range(0, flat_q_rows, q_chunk_size):
             chunk_size = q_chunk_size
 
             q_head_chunk = q_head_full[q_start:q_start + chunk_size]
 
-            m_chunk_ref = m_head_ref.at[q_start:q_start + chunk_size]
-            l_chunk_ref = l_head_ref.at[q_start:q_start + chunk_size]
-            acc_chunk_ref = acc_head_ref.at[q_start:q_start + chunk_size]
-
-            m_prev = m_chunk_ref[...]
-            l_prev = l_chunk_ref[...]
-            acc_prev = acc_chunk_ref[...]
-
-            m_curr_accum = m_prev
-            l_curr_accum = l_prev
-            acc_curr_accum = acc_prev
+            m_slice = m_ref.at[kv_head_idx, q_start:q_start + chunk_size]
+            l_slice = l_ref.at[kv_head_idx, q_start:q_start + chunk_size]
+            acc_slice = acc_ref.at[kv_head_idx, q_start:q_start + chunk_size]
 
             for kv_start in range(0, kv_block_tokens, kv_chunk_size):
                 k_chunk = k_full[kv_start : kv_start + kv_chunk_size]
                 v_chunk = v_full[kv_start : kv_start + kv_chunk_size]
 
-                # scores = (jnp.matmul(q_head_chunk, k_chunk.T, preferred_element_type=jnp.float32) *
-                        #   sm_scale)
-                scores = lax.dot_general(
+                cur_p, cur_v, cur_alpha = flash_attention_step1_qk_softmax(
                     q_head_chunk,
                     k_chunk,
-                    dimension_numbers=(([1], [1]), ([], [])),
-                    preferred_element_type=jnp.float32,
+                    v_chunk,
+                    m_slice,
+                    l_slice,
+                    q_start=q_start,
+                    kv_start=kv_start,
                 )
-                q_row_idx = q_start + lax.broadcasted_iota(jnp.int32, scores.shape, 0)
-                q_token_idx = lax.div(q_row_idx, q_per_kv)
-                q_interleave = page_size
-                q_chunk_idx = lax.div(q_token_idx, q_interleave)
-                q_chunk_offset = lax.rem(q_token_idx, q_interleave)
-                q_pos = (q_global_start +
-                         q_chunk_idx * pcp_size * q_interleave + q_chunk_offset)
-                
-                kv_local_pos = kv_start + lax.broadcasted_iota(jnp.int32, scores.shape, 1)
-                kv_page_offset = lax.div(kv_local_pos, page_size)
-                kv_token_offset = lax.rem(kv_local_pos, page_size)
-                kv_pos = (kv_global_start +
-                          kv_page_offset * pcp_size * page_size + kv_token_offset)
-                
-                kv_valid = kv_local_pos < kv_valid_len
-                q_valid = q_token_idx < q_tile_size
-                entry_valid = req_id != -1
-                row_active = jnp.logical_and(entry_valid, q_valid[:, :1])
-                mask = jnp.logical_and(jnp.logical_and(q_pos >= kv_pos, kv_valid),
-                                       q_valid)
-                scores = jnp.where(mask, scores, -jnp.inf)
-                scores = jnp.where(row_active, scores, 0.0)
 
-                m_curr = jnp.max(scores, axis=1, keepdims=True)
-                m_next = jnp.where(row_active, jnp.maximum(m_curr_accum, m_curr), m_curr_accum)
-                p = jnp.where(row_active,
-                              jnp.exp(scores - jnp.broadcast_to(m_next[..., :1], scores.shape)),
-                              0.0)
-                alpha = jnp.where(row_active, jnp.exp(m_curr_accum - m_next), 1.0)
-                l_next = alpha * l_curr_accum + jnp.sum(p, axis=1, keepdims=True)
-                pv = jnp.matmul(p, v_chunk, preferred_element_type=jnp.float32)
-                acc_next = jnp.broadcast_to(alpha[..., :1], acc_curr_accum.shape) * acc_curr_accum + pv
+                if prev_p is not None:
+                    flash_attention_step2_pv(
+                        prev_p,
+                        prev_v,
+                        prev_alpha,
+                        prev_acc_slice,
+                    )
 
-                m_curr_accum = m_next
-                l_curr_accum = l_next
-                acc_curr_accum = acc_next
+                prev_p = cur_p
+                prev_v = cur_v
+                prev_alpha = cur_alpha
+                prev_acc_slice = acc_slice
 
-            m_chunk_ref[...] = m_curr_accum.astype(m_chunk_ref.dtype)
-            l_chunk_ref[...] = l_curr_accum.astype(l_chunk_ref.dtype)
-            acc_chunk_ref[...] = acc_curr_accum.astype(acc_chunk_ref.dtype)
+    if prev_p is not None:
+        flash_attention_step2_pv(
+            prev_p,
+            prev_v,
+            prev_alpha,
+            prev_acc_slice,
+        )
 
 
 def _load_schedule_step(packed_schedule_ref, sched_vmem_ref, sem, step):
