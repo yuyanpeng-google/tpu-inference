@@ -105,7 +105,7 @@ def _consume_scheduled_kv_page(
     acc_next = jnp.broadcast_to(alpha, acc.shape) * acc + pv
     return m_next, l_next, acc_next
 
-
+@jax.named_scope("_consume_scheduled_kv_page_multi_head")
 def _consume_scheduled_kv_page_multi_head(
     q_vmem_ref,
     kv_vmem_ref,
@@ -139,7 +139,37 @@ def _consume_scheduled_kv_page_multi_head(
         q_compute_size: The chunk size for tiling queries (default: 512).
         kv_compute_size: The chunk size for tiling keys and values (default: 512).
     """
-    q = q_vmem_ref[...].astype(jnp.float32)
+    def strided_load(ref, start, sz, step, *, dtype=None):
+        """Loads data from a reference with strided access, handling 128-lane alignment on TPU.
+
+        Args:
+            ref: The 2D Pallas VMEM reference to load from.
+            start: The start index for strided loading.
+            sz: The total size spanned by the strided loading window.
+            step: The step size between elements to load.
+            dtype: Optional target data type to bitcast the loaded array into.
+
+        Returns:
+            A JAX array of shape (sz // step, ref.shape[1]) with strided loaded elements.
+        """
+        assert get_dtype_packing(ref.dtype) == 1
+        assert len(ref.shape) == 2
+        r, l = ref.shape  # noqa
+        assert l % 128 == 0
+        folds = l // 128
+        ref = ref.reshape(r * folds, 128)
+        start *= folds
+        sz *= folds
+        step *= folds
+        assert sz % step == 0
+        vec = jnp.concat(
+            [ref[pl.ds(start + i, sz // step, step)] for i in range(folds)],
+            axis=1)
+        if dtype is not None:
+            vec = pltpu.bitcast(vec, dtype)
+        return vec
+
+    q = q_vmem_ref[...]
 
     q_global_start = sched_vmem_ref[consumer_rank, lane,
                                     ScheduleField.Q_GLOBAL_START]
@@ -161,13 +191,24 @@ def _consume_scheduled_kv_page_multi_head(
     assert (flat_q_rows % q_chunk_size) == 0
     assert (kv_block_tokens % kv_chunk_size) == 0
 
+    head_dim = q_vmem_ref.shape[-1]
+    kv_heads = kv_vmem_ref.shape[3]
+    kv_ref = kv_vmem_ref.at[slot].bitcast(jnp.uint32)
+    kv_flat_ref = kv_ref.reshape(kv_block_tokens * kv_heads, head_dim)
+
     for kv_head_idx in range(q_vmem_ref.shape[1]):
         q_head_full = q[:, kv_head_idx, :, :].reshape(flat_q_rows,
                                                      q_vmem_ref.shape[-1])
-        k_full = kv_vmem_ref.at[slot, :, :, kv_head_idx, 0, :][...].astype(
-            jnp.float32)
-        v_full = kv_vmem_ref.at[slot, :, :, kv_head_idx, 1, :][...].astype(
-            jnp.float32)
+        kv_head_loaded = strided_load(
+            kv_flat_ref,
+            start=kv_head_idx,
+            sz=kv_block_tokens * kv_heads,
+            step=kv_heads,
+        )
+        k_uint32 = kv_head_loaded[:, :head_dim // 2]
+        v_uint32 = kv_head_loaded[:, head_dim // 2:]
+        k_full = pltpu.bitcast(k_uint32, q_vmem_ref.dtype)
+        v_full = pltpu.bitcast(v_uint32, q_vmem_ref.dtype)
         k_full = k_full.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
         v_full = v_full.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
 
@@ -196,8 +237,14 @@ def _consume_scheduled_kv_page_multi_head(
                 k_chunk = k_full[kv_start : kv_start + kv_chunk_size]
                 v_chunk = v_full[kv_start : kv_start + kv_chunk_size]
 
-                scores = (jnp.matmul(q_head_chunk, k_chunk.T, preferred_element_type=jnp.float32) *
-                          sm_scale)
+                # scores = (jnp.matmul(q_head_chunk, k_chunk.T, preferred_element_type=jnp.float32) *
+                        #   sm_scale)
+                scores = lax.dot_general(
+                    q_head_chunk,
+                    k_chunk,
+                    dimension_numbers=(([1], [1]), ([], [])),
+                    preferred_element_type=jnp.float32,
+                )
                 q_row_idx = q_start + lax.broadcasted_iota(jnp.int32, scores.shape, 0)
                 q_token_idx = lax.div(q_row_idx, q_per_kv)
                 q_interleave = page_size
@@ -671,18 +718,18 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
                                    ScheduleField.IS_LAST_KV] != 0,
                 )
 
-                @pl.when(round_idx < pcp_size - 1)
-                def _remote_copy_start():
-                    remote_op = pltpu.make_async_remote_copy(
-                        src_ref=kv_vmem_ref.at[curr_slot],
-                        dst_ref=kv_vmem_ref.at[next_slot],
-                        send_sem=remote_send_sems.at[lane, round_idx],
-                        recv_sem=remote_recv_sems.at[lane, round_idx],
-                        device_id=next_device_id,
-                        device_id_type=pl.DeviceIdType.MESH,
-                    )
-                    remote_op.start()
-
+                # @pl.when(round_idx < pcp_size - 1)
+                # def _remote_copy_start():
+                #     remote_op = pltpu.make_async_remote_copy(
+                #         src_ref=kv_vmem_ref.at[curr_slot],
+                #         dst_ref=kv_vmem_ref.at[next_slot],
+                #         send_sem=remote_send_sems.at[lane, round_idx],
+                #         recv_sem=remote_recv_sems.at[lane, round_idx],
+                #         device_id=next_device_id,
+                #         device_id_type=pl.DeviceIdType.MESH,
+                #     )
+                #     remote_op.start()
+                print("!!!!!SKIP RDMA!!!!!")
                 _consume_scheduled_kv_page_multi_head(
                     q_vmem_ref,
                     kv_vmem_ref,
@@ -699,18 +746,18 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
                     kv_compute_size=kv_compute_size,
                 )
 
-                @pl.when(round_idx < pcp_size - 1)
-                def _remote_copy_wait():
-                    remote_op = pltpu.make_async_remote_copy(
-                        src_ref=kv_vmem_ref.at[curr_slot],
-                        dst_ref=kv_vmem_ref.at[next_slot],
-                        send_sem=remote_send_sems.at[lane, round_idx],
-                        recv_sem=remote_recv_sems.at[lane, round_idx],
-                        device_id=next_device_id,
-                        device_id_type=pl.DeviceIdType.MESH,
-                    )
-                    remote_op.wait()
-                    util.local_barrier(prev_device_id, next_device_id)
+                # @pl.when(round_idx < pcp_size - 1)
+                # def _remote_copy_wait():
+                #     remote_op = pltpu.make_async_remote_copy(
+                #         src_ref=kv_vmem_ref.at[curr_slot],
+                #         dst_ref=kv_vmem_ref.at[next_slot],
+                #         send_sem=remote_send_sems.at[lane, round_idx],
+                #         recv_sem=remote_recv_sems.at[lane, round_idx],
+                #         device_id=next_device_id,
+                #         device_id_type=pl.DeviceIdType.MESH,
+                #     )
+                #     remote_op.wait()
+                #     util.local_barrier(prev_device_id, next_device_id)
 
                 return group_has_last
 
@@ -1204,7 +1251,7 @@ def pcp_streaming_attention_page_groups_packed_local(
     kv_pages_per_block: int = 1,
     mesh_axis_names: tuple[str, ...] = (AXIS, ),
     pcp_axis_name: str = AXIS,
-    q_compute_size: int = 4096,
+    q_compute_size: int = 512,
     kv_compute_size: int = 512,
 ):
     """Run PCP streaming page groups on batched-RPA packed KV cache layout.
