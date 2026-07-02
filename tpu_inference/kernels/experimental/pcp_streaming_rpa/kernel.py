@@ -48,9 +48,24 @@ def maybe_named_scope(name: str):
             yield scope
     else:
         yield nullcontext()
-        
 
+def cdiv(a, b):
+    assert b != 0
+    return (a + b - 1) // b
 
+def align_to(x, a):
+    return cdiv(x, a) * a
+
+def broadcast_minor(src, shape):
+    if src.shape == shape:
+        return src
+    assert src.shape[:-1] == shape[:-1]
+    assert src.shape[-1] % 128 == 0
+    target_minor = align_to(shape[-1], src.shape[-1])
+    # no-op concatenation.
+    return jnp.concatenate(
+        [src for _ in range(target_minor // src.shape[-1])],
+        axis=-1)[..., :shape[-1]]
 
 def _pcp_streaming_vmem_limit_bytes() -> int:
     limit_bytes = envs.PCP_STREAMING_RPA_VMEM_LIMIT_BYTES
@@ -230,7 +245,10 @@ def _consume_scheduled_kv_page_multi_head(
             kv_token_offset = lax.rem(kv_local_pos, page_size)
             kv_pos = (kv_global_start +
                     kv_page_offset * pcp_size * page_size + kv_token_offset)
-            
+        
+        # entry_valid.shape=(), q_valid.shape=(512, 256), row_active.shape=(512, 1), mask.shape=(512, 256)
+        # scores.shape=(512, 256), m_next.shape=(512, 128), alpha.shape=(512, 128), l_prev.shape=(512, 128), p.shape=(512, 256)
+
         with maybe_named_scope("valid mask"):
             kv_valid = kv_local_pos < kv_valid_len
             q_valid = q_token_idx < q_tile_size
@@ -238,17 +256,17 @@ def _consume_scheduled_kv_page_multi_head(
             row_active = jnp.logical_and(entry_valid, q_valid[:, :1])
             mask = jnp.logical_and(jnp.logical_and(q_pos >= kv_pos, kv_valid),
                                 q_valid)
-            scores = jnp.where(mask, scores, -jnp.inf)
-            scores = jnp.where(row_active, scores, 0.0)
+            mask = jnp.logical_and(mask, row_active)
+            scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
 
         with maybe_named_scope("softmax"):
             m_curr = jnp.max(scores, axis=1, keepdims=True)
             m_prev = m_slice[...]
-            m_next = jnp.where(row_active, jnp.maximum(m_prev, m_curr), m_prev)
+            m_next = jnp.maximum(m_prev, m_curr)
             m_slice[...] = m_next.astype(m_slice.dtype)
 
             p = jnp.where(row_active,
-                        jnp.exp(scores - jnp.broadcast_to(m_next[..., :1], scores.shape)),
+                        jnp.exp(scores - broadcast_minor(m_next, scores.shape)),
                         0.0)
             alpha = jnp.where(row_active, jnp.exp(m_prev - m_next), 1.0)
             l_prev = l_slice[...]
@@ -268,7 +286,7 @@ def _consume_scheduled_kv_page_multi_head(
         with maybe_named_scope("pv"):
             pv = jnp.matmul(p, v_chunk, preferred_element_type=jnp.float32)
             acc_prev = acc_slice[...]
-            acc_next = jnp.broadcast_to(alpha[..., :1], acc_prev.shape) * acc_prev + pv
+            acc_next = broadcast_minor(alpha, acc_prev.shape) * acc_prev + pv
             acc_slice[...] = acc_next.astype(acc_slice.dtype)
 
     q = q_vmem_ref[...]
@@ -796,18 +814,19 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
                                    ScheduleField.IS_LAST_KV] != 0,
                 )
 
-                # @pl.when(round_idx < pcp_size - 1)
-                # def _remote_copy_start():
-                #     remote_op = pltpu.make_async_remote_copy(
-                #         src_ref=kv_vmem_ref.at[curr_slot],
-                #         dst_ref=kv_vmem_ref.at[next_slot],
-                #         send_sem=remote_send_sems.at[lane, round_idx],
-                #         recv_sem=remote_recv_sems.at[lane, round_idx],
-                #         device_id=next_device_id,
-                #         device_id_type=pl.DeviceIdType.MESH,
-                #     )
-                #     remote_op.start()
-                print("!!!!!SKIP RDMA!!!!!")
+                @pl.when(round_idx < pcp_size - 1)
+                def _remote_copy_start():
+                    remote_op = pltpu.make_async_remote_copy(
+                        src_ref=kv_vmem_ref.at[curr_slot],
+                        dst_ref=kv_vmem_ref.at[next_slot],
+                        send_sem=remote_send_sems.at[lane, round_idx],
+                        recv_sem=remote_recv_sems.at[lane, round_idx],
+                        device_id=next_device_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                    remote_op.start()
+
+                # print("!!!!!SKIP RDMA!!!!!")
                 _consume_scheduled_kv_page_multi_head(
                     q_vmem_ref,
                     kv_vmem_ref,
@@ -824,18 +843,18 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
                     kv_compute_size=kv_compute_size,
                 )
 
-                # @pl.when(round_idx < pcp_size - 1)
-                # def _remote_copy_wait():
-                #     remote_op = pltpu.make_async_remote_copy(
-                #         src_ref=kv_vmem_ref.at[curr_slot],
-                #         dst_ref=kv_vmem_ref.at[next_slot],
-                #         send_sem=remote_send_sems.at[lane, round_idx],
-                #         recv_sem=remote_recv_sems.at[lane, round_idx],
-                #         device_id=next_device_id,
-                #         device_id_type=pl.DeviceIdType.MESH,
-                #     )
-                #     remote_op.wait()
-                #     util.local_barrier(prev_device_id, next_device_id)
+                @pl.when(round_idx < pcp_size - 1)
+                def _remote_copy_wait():
+                    remote_op = pltpu.make_async_remote_copy(
+                        src_ref=kv_vmem_ref.at[curr_slot],
+                        dst_ref=kv_vmem_ref.at[next_slot],
+                        send_sem=remote_send_sems.at[lane, round_idx],
+                        recv_sem=remote_recv_sems.at[lane, round_idx],
+                        device_id=next_device_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                    remote_op.wait()
+                    util.local_barrier(prev_device_id, next_device_id)
 
                 return group_has_last
 
