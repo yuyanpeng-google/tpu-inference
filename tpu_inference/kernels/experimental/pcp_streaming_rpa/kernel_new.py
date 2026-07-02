@@ -1,0 +1,1574 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""PCP streaming prefill RPA kernels.
+
+This module currently contains the first production-shaped MVP kernels for the
+RingAttention-style PCP path. They intentionally support only page-grouped
+schedules. The packed KV-cache production path has a multi-head Pallas kernel
+so one ring transfer is consumed by all local query heads instead of repeating
+the same schedule and communication once per head pair.
+"""
+
+import functools
+
+import jax
+import jax.numpy as jnp
+from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+from tpu_inference import envs
+from tpu_inference.kernels.collectives import util
+from tpu_inference.kernels.experimental.batched_rpa.utils import get_dtype_packing
+from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
+    ScheduleField)
+
+P = jax.sharding.PartitionSpec
+AXIS = "pcp"
+
+import os
+from contextlib import contextmanager, nullcontext
+
+@contextmanager
+def maybe_named_scope(name: str):
+    if os.environ.get("ENABLE_NAMED_SCOPE", None):
+        with jax.named_scope(name) as scope:
+            yield scope
+    else:
+        yield nullcontext()
+
+def cdiv(a, b):
+    assert b != 0
+    return (a + b - 1) // b
+
+def align_to(x, a):
+    return cdiv(x, a) * a
+
+def broadcast_minor(src, shape):
+    if src.shape == shape:
+        return src
+    assert src.shape[:-1] == shape[:-1]
+    assert src.shape[-1] % 128 == 0
+    target_minor = align_to(shape[-1], src.shape[-1])
+    # no-op concatenation.
+    return jnp.concatenate(
+        [src for _ in range(target_minor // src.shape[-1])],
+        axis=-1)[..., :shape[-1]]
+
+def _pcp_streaming_vmem_limit_bytes() -> int:
+    limit_bytes = envs.PCP_STREAMING_RPA_VMEM_LIMIT_BYTES
+    if limit_bytes < 0:
+        raise ValueError("PCP_STREAMING_RPA_VMEM_LIMIT_BYTES must be >= 0.")
+    if limit_bytes == 0:
+        return pltpu.get_tpu_info().vmem_capacity_bytes
+    return limit_bytes
+
+
+def _consume_scheduled_kv_page(
+    q_vmem_ref,
+    kv_vmem_ref,
+    sched_vmem_ref,
+    slot,
+    consumer_rank,
+    lane,
+    m,
+    l,
+    acc,
+    *,
+    sm_scale,
+    pcp_size,
+):
+    q = q_vmem_ref[...].astype(jnp.float32)
+    k = kv_vmem_ref.at[slot, :, 0, :][...].astype(jnp.float32)
+    v = kv_vmem_ref.at[slot, :, 1, :][...].astype(jnp.float32)
+
+    q_global_start = sched_vmem_ref[consumer_rank, lane,
+                                    ScheduleField.Q_GLOBAL_START]
+    kv_global_start = sched_vmem_ref[consumer_rank, lane,
+                                     ScheduleField.KV_GLOBAL_START]
+    req_id = sched_vmem_ref[consumer_rank, lane, ScheduleField.REQ_ID]
+    kv_valid_len = sched_vmem_ref[consumer_rank, lane,
+                                  ScheduleField.KV_VALID_LEN]
+    q_tile_size = sched_vmem_ref[consumer_rank, lane,
+                                 ScheduleField.Q_TILE_SIZE]
+
+    scores = jnp.matmul(q, k.T, preferred_element_type=jnp.float32) * sm_scale
+    q_row = lax.broadcasted_iota(jnp.int32, scores.shape, 0)
+    q_interleave = kv_vmem_ref.shape[1]
+    q_chunk_idx = lax.div(q_row, q_interleave)
+    q_chunk_offset = lax.rem(q_row, q_interleave)
+    q_pos = (q_global_start +
+             q_chunk_idx * pcp_size * q_interleave + q_chunk_offset)
+    kv_pos = kv_global_start + lax.broadcasted_iota(jnp.int32, scores.shape, 1)
+    kv_valid = lax.broadcasted_iota(jnp.int32, scores.shape, 1) < kv_valid_len
+    q_valid = lax.broadcasted_iota(jnp.int32, scores.shape, 0) < q_tile_size
+    entry_valid = req_id != -1
+    row_active = jnp.logical_and(entry_valid,
+                                 q_valid[:, :1])
+    mask = jnp.logical_and(jnp.logical_and(q_pos >= kv_pos, kv_valid),
+                           q_valid)
+    scores = jnp.where(mask, scores, -jnp.inf)
+    scores = jnp.where(row_active, scores, 0.0)
+
+    m_curr = jnp.max(scores, axis=1, keepdims=True)
+    m_next = jnp.where(row_active, jnp.maximum(m, m_curr), m)
+    p = jnp.where(row_active,
+                  jnp.exp(scores - jnp.broadcast_to(m_next, scores.shape)),
+                  0.0)
+    alpha = jnp.where(row_active, jnp.exp(m - m_next), 1.0)
+    l_next = alpha * l + jnp.sum(p, axis=1, keepdims=True)
+    pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
+    acc_next = jnp.broadcast_to(alpha, acc.shape) * acc + pv
+    return m_next, l_next, acc_next
+
+@jax.named_scope("_consume_scheduled_kv_page_multi_head")
+def _consume_scheduled_kv_page_multi_head(
+    q_vmem_ref,
+    kv_vmem_ref,
+    sched_vmem_ref,
+    slot,
+    consumer_rank,
+    lane,
+    l_ref,
+    m_ref,
+    acc_ref,
+    *,
+    sm_scale,
+    pcp_size,
+    q_compute_size: int,
+    kv_compute_size: int,
+):
+    """Consumes a scheduled KV page block across all multi-heads in-place with query and KV tiling.
+
+    Args:
+        q_vmem_ref: VMEM reference of local query states.
+        kv_vmem_ref: VMEM reference of local key/value cache block.
+        sched_vmem_ref: VMEM reference of local step schedule.
+        slot: Slot index in the double-buffered KV cache block.
+        consumer_rank: Current PCP rank of the calling device.
+        lane: Active schedule lane index.
+        l_ref: VMEM reference to scratch buffer representing flash attention denominator 'l'.
+        m_ref: VMEM reference to scratch buffer representing flash attention max score 'm'.
+        acc_ref: VMEM reference to scratch buffer representing accumulated output 'acc'.
+        sm_scale: Softmax scale factor.
+        pcp_size: Physical device ring/topology size.
+        q_compute_size: The chunk size for tiling queries (default: 512).
+        kv_compute_size: The chunk size for tiling keys and values (default: 512).
+    """
+    def strided_load(ref, start, sz, step, *, dtype=None):
+        """Loads data from a reference with strided access, handling 128-lane alignment on TPU.
+
+        Args:
+            ref: The 2D Pallas VMEM reference to load from.
+            start: The start index for strided loading.
+            sz: The total size spanned by the strided loading window.
+            step: The step size between elements to load.
+            dtype: Optional target data type to bitcast the loaded array into.
+
+        Returns:
+            A JAX array of shape (sz // step, ref.shape[1]) with strided loaded elements.
+        """
+        assert get_dtype_packing(ref.dtype) == 1
+        assert len(ref.shape) == 2
+        r, l = ref.shape  # noqa
+        assert l % 128 == 0
+        folds = l // 128
+        ref = ref.reshape(r * folds, 128)
+        start *= folds
+        sz *= folds
+        step *= folds
+        assert sz % step == 0
+        vec = jnp.concat(
+            [ref[pl.ds(start + i, sz // step, step)] for i in range(folds)],
+            axis=1)
+        if dtype is not None:
+            vec = pltpu.bitcast(vec, dtype)
+        return vec
+
+    def flash_attention_step1_qk_softmax(
+        q_head_chunk,
+        k_chunk,
+        v_chunk,
+        m_slice,
+        l_slice,
+        *,
+        q_start,
+        kv_start,
+    ):
+        """Computes query-key dot products, applies masks, and performs online softmax reduction in-place.
+
+        Args:
+            q_head_chunk: Current query chunk of shape (q_chunk_size, head_dim).
+            k_chunk: Current key chunk of shape (kv_chunk_size, head_dim).
+            v_chunk: Current value chunk of shape (kv_chunk_size, head_dim).
+            m_slice: VMEM reference slice for running maximum of attention scores.
+            l_slice: VMEM reference slice for running denominator for online softmax.
+            q_start: Global query start index within the chunk.
+            kv_start: Global key/value start index within the block.
+
+        Returns:
+            A tuple of (p, v_chunk, alpha) representing:
+            - p: Scaled attention probabilities of shape (q_chunk_size, kv_chunk_size).
+            - v_chunk: The current value chunk of shape (kv_chunk_size, head_dim).
+            - alpha: The scaling factor (exp(m_prev - m_next)) of shape (q_chunk_size, 1).
+        """
+        with maybe_named_scope("qk"):
+            scores = lax.dot_general(
+                q_head_chunk,
+                k_chunk,
+                dimension_numbers=(([1], [1]), ([], [])),
+                preferred_element_type=jnp.float32,
+            )
+        with maybe_named_scope("pos"):
+            q_row_idx = q_start + lax.broadcasted_iota(jnp.int32, scores.shape, 0)
+            q_token_idx = lax.div(q_row_idx, q_per_kv)
+            q_interleave = page_size
+            q_chunk_idx = lax.div(q_token_idx, q_interleave)
+            q_chunk_offset = lax.rem(q_token_idx, q_interleave)
+            q_pos = (q_global_start +
+                    q_chunk_idx * pcp_size * q_interleave + q_chunk_offset)
+            
+            kv_local_pos = kv_start + lax.broadcasted_iota(jnp.int32, scores.shape, 1)
+            kv_page_offset = lax.div(kv_local_pos, page_size)
+            kv_token_offset = lax.rem(kv_local_pos, page_size)
+            kv_pos = (kv_global_start +
+                    kv_page_offset * pcp_size * page_size + kv_token_offset)
+        
+        # entry_valid.shape=(), q_valid.shape=(512, 256), row_active.shape=(512, 1), mask.shape=(512, 256)
+        # scores.shape=(512, 256), m_next.shape=(512, 128), alpha.shape=(512, 128), l_prev.shape=(512, 128), p.shape=(512, 256)
+
+        with maybe_named_scope("valid mask"):
+            kv_valid = kv_local_pos < kv_valid_len
+            q_valid = q_token_idx < q_tile_size
+            entry_valid = req_id != -1
+            row_active = jnp.logical_and(entry_valid, q_valid[:, :1])
+            mask = jnp.logical_and(jnp.logical_and(q_pos >= kv_pos, kv_valid),
+                                q_valid)
+            mask = jnp.logical_and(mask, row_active)
+            scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
+
+        with maybe_named_scope("softmax"):
+            m_curr = jnp.max(scores, axis=1, keepdims=True)
+            m_prev = m_slice[...]
+            m_next = jnp.maximum(m_prev, m_curr)
+            m_slice[...] = m_next.astype(m_slice.dtype)
+
+            p = jnp.where(row_active,
+                        jnp.exp(scores - broadcast_minor(m_next, scores.shape)),
+                        0.0)
+            alpha = jnp.where(row_active, jnp.exp(m_prev - m_next), 1.0)
+            l_prev = l_slice[...]
+            l_next = alpha * l_prev + jnp.sum(p, axis=1, keepdims=True)
+            l_slice[...] = l_next.astype(l_slice.dtype)
+        return p, v_chunk, alpha
+
+    def flash_attention_step2_pv(p, v_chunk, alpha, acc_slice):
+        """Computes probabilities-values matrix multiplication and updates outputs in-place with scaling.
+
+        Args:
+            p: Attention probabilities of shape (q_chunk_size, kv_chunk_size).
+            v_chunk: Key/value value chunk of shape (kv_chunk_size, head_dim).
+            alpha: Scaling factor from online softmax step of shape (q_chunk_size, 1).
+            acc_slice: VMEM reference slice to accumulated attention output.
+        """
+        with maybe_named_scope("pv"):
+            pv = jnp.matmul(p, v_chunk, preferred_element_type=jnp.float32)
+            acc_prev = acc_slice[...]
+            acc_next = broadcast_minor(alpha, acc_prev.shape) * acc_prev + pv
+            acc_slice[...] = acc_next.astype(acc_slice.dtype)
+
+    q = q_vmem_ref[...]
+
+    q_global_start = sched_vmem_ref[consumer_rank, lane,
+                                    ScheduleField.Q_GLOBAL_START]
+    kv_global_start = sched_vmem_ref[consumer_rank, lane,
+                                     ScheduleField.KV_GLOBAL_START]
+    req_id = sched_vmem_ref[consumer_rank, lane, ScheduleField.REQ_ID]
+    kv_valid_len = sched_vmem_ref[consumer_rank, lane,
+                                  ScheduleField.KV_VALID_LEN]
+    q_tile_size = sched_vmem_ref[consumer_rank, lane,
+                                 ScheduleField.Q_TILE_SIZE]
+    q_per_kv = q_vmem_ref.shape[2]
+    flat_q_rows = q_vmem_ref.shape[0] * q_per_kv
+    page_size = kv_vmem_ref.shape[2]
+    kv_block_tokens = kv_vmem_ref.shape[1] * page_size
+
+    # q_compute_size = 1024
+    q_chunk_size = min(q_compute_size, flat_q_rows)
+    kv_chunk_size = min(kv_compute_size, kv_block_tokens)
+
+    assert (flat_q_rows % q_chunk_size) == 0
+    assert (kv_block_tokens % kv_chunk_size) == 0
+
+    head_dim = q_vmem_ref.shape[-1]
+    kv_heads = kv_vmem_ref.shape[3]
+    kv_ref = kv_vmem_ref.at[slot].bitcast(jnp.uint32)
+    kv_flat_ref = kv_ref.reshape(kv_block_tokens * kv_heads, head_dim)
+
+    prev_p = None
+    prev_v = None
+    prev_alpha = None
+    prev_acc_slice = None
+
+    for kv_head_idx in range(q_vmem_ref.shape[1]):
+        q_head_full = q[:, kv_head_idx, :, :].reshape(flat_q_rows,
+                                                     q_vmem_ref.shape[-1])
+        kv_head_loaded = strided_load(
+            kv_flat_ref,
+            start=kv_head_idx,
+            sz=kv_block_tokens * kv_heads,
+            step=kv_heads,
+        )
+        k_uint32 = kv_head_loaded[:, :head_dim // 2]
+        v_uint32 = kv_head_loaded[:, head_dim // 2:]
+        k_full = pltpu.bitcast(k_uint32, q_vmem_ref.dtype)
+        v_full = pltpu.bitcast(v_uint32, q_vmem_ref.dtype)
+        k_full = k_full.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
+        v_full = v_full.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
+
+        for q_start in range(0, flat_q_rows, q_chunk_size):
+            chunk_size = q_chunk_size
+
+            q_head_chunk = q_head_full[q_start:q_start + chunk_size]
+
+            m_slice = m_ref.at[kv_head_idx, q_start:q_start + chunk_size]
+            l_slice = l_ref.at[kv_head_idx, q_start:q_start + chunk_size]
+            acc_slice = acc_ref.at[kv_head_idx, q_start:q_start + chunk_size]
+
+            for kv_start in range(0, kv_block_tokens, kv_chunk_size):
+                k_chunk = k_full[kv_start : kv_start + kv_chunk_size]
+                v_chunk = v_full[kv_start : kv_start + kv_chunk_size]
+
+                cur_p, cur_v, cur_alpha = flash_attention_step1_qk_softmax(
+                    q_head_chunk,
+                    k_chunk,
+                    v_chunk,
+                    m_slice,
+                    l_slice,
+                    q_start=q_start,
+                    kv_start=kv_start,
+                )
+
+                if prev_p is not None:
+                    flash_attention_step2_pv(
+                        prev_p,
+                        prev_v,
+                        prev_alpha,
+                        prev_acc_slice,
+                    )
+
+                prev_p = cur_p
+                prev_v = cur_v
+                prev_alpha = cur_alpha
+                prev_acc_slice = acc_slice
+
+    if prev_p is not None:
+        flash_attention_step2_pv(
+            prev_p,
+            prev_v,
+            prev_alpha,
+            prev_acc_slice,
+        )
+
+
+def _load_schedule_step(packed_schedule_ref, sched_vmem_ref, sem, step):
+    load_op = pltpu.make_async_copy(
+        src_ref=packed_schedule_ref.at[step],
+        dst_ref=sched_vmem_ref.at[:, :, :],
+        sem=sem,
+    )
+    load_op.start()
+    load_op.wait()
+
+
+def _source_page_idx_from_staged_schedule(sched_vmem_ref, source_rank, lane,
+                                          pcp_size, page_offset=0):
+    page_idx = jnp.array(0, dtype=jnp.int32)
+    for consumer_rank in range(pcp_size):
+        req_id = sched_vmem_ref[consumer_rank, lane, ScheduleField.REQ_ID]
+        kv_page_rank = sched_vmem_ref[consumer_rank, lane,
+                                      ScheduleField.KV_PAGE_RANK]
+        candidate = jnp.logical_and(req_id != -1, kv_page_rank == source_rank)
+        if page_offset == 0:
+            page_field = ScheduleField.KV_PAGE_IDX
+        else:
+            page_field = ScheduleField.KV_PAGE_INDICES_START + page_offset
+        page_idx = jnp.where(candidate,
+                             sched_vmem_ref[consumer_rank, lane, page_field],
+                             page_idx)
+    return page_idx
+
+
+def _load_local_kv_page(kv_cache_ref, kv_vmem_ref, sem, local_page_idx, *,
+                        kv_head_idx, kv_packing, packed_kv_cache):
+    if packed_kv_cache:
+        if kv_packing == 2:
+            load = pltpu.make_async_copy(
+                src_ref=kv_cache_ref.at[0, local_page_idx, :, kv_head_idx, :, :],
+                dst_ref=kv_vmem_ref.at[0],
+                sem=sem,
+            )
+            load.start()
+            load.wait()
+        elif kv_packing == 1:
+            for kv_pair_idx in range(2):
+                linear_idx = kv_head_idx * 2 + kv_pair_idx
+                load = pltpu.make_async_copy(
+                    src_ref=kv_cache_ref.at[
+                        0,
+                        local_page_idx,
+                        :,
+                        linear_idx,
+                        0,
+                        :,
+                    ],
+                    dst_ref=kv_vmem_ref.at[0, :, kv_pair_idx, :],
+                    sem=sem,
+                )
+                load.start()
+                load.wait()
+        else:
+            raise NotImplementedError(
+                "packed PCP streaming KV loads currently support "
+                "kv_packing in {1, 2}.")
+    else:
+        load = pltpu.make_async_copy(
+            src_ref=kv_cache_ref.at[0, local_page_idx, :, 0, :, :],
+            dst_ref=kv_vmem_ref.at[0],
+            sem=sem,
+        )
+        load.start()
+        load.wait()
+
+
+def _load_local_kv_page_block_all_heads_packed(kv_cache_ref, kv_vmem_ref, sem,
+                                               sched_vmem_ref, source_rank,
+                                               lane, *, pcp_size, kv_heads,
+                                               kv_packing,
+                                               kv_pages_per_block):
+    if kv_packing != 2:
+        raise NotImplementedError(
+            "multi-head packed PCP streaming loads currently require "
+            "kv_packing=2.")
+    for page_offset in range(kv_pages_per_block):
+        local_page_idx = _source_page_idx_from_staged_schedule(
+            sched_vmem_ref,
+            source_rank,
+            lane,
+            pcp_size,
+            page_offset=page_offset,
+        )
+        load = pltpu.make_async_copy(
+            src_ref=kv_cache_ref.at[
+                0,
+                local_page_idx,
+                :,
+                pl.ds(0, kv_heads),
+                :,
+                :,
+            ],
+            dst_ref=kv_vmem_ref.at[0, page_offset],
+            sem=sem,
+        )
+        load.start()
+        load.wait()
+
+
+def _mesh_device_id(mesh_axis_names, pcp_axis_name, pcp_rank):
+    return tuple(
+        pcp_rank if axis_name == pcp_axis_name else lax.axis_index(axis_name)
+        for axis_name in mesh_axis_names)
+
+
+def _pcp_streaming_attention_page_groups_kernel(
+    active_page_groups_ref,
+    q_ref,
+    kv_cache_ref,
+    packed_schedule_ref,
+    o_ref,
+    sched_dma_sem,
+    local_dma_sem,
+    remote_send_sems,
+    remote_recv_sems,
+    sched_vmem_ref,
+    q_vmem_ref,
+    kv_vmem_ref,
+    o_vmem_ref,
+    *,
+    pcp_size,
+    num_lanes,
+    q_block_size,
+    num_page_groups,
+    num_q_blocks,
+    sm_scale,
+    kv_head_idx,
+    kv_packing,
+    packed_kv_cache,
+    mesh_axis_names,
+    pcp_axis_name,
+):
+    my_id = lax.axis_index(pcp_axis_name)
+    next_rank = lax.rem(my_id + 1, pcp_size)
+    prev_rank = lax.rem(my_id + pcp_size - 1, pcp_size)
+    next_device_id = _mesh_device_id(mesh_axis_names, pcp_axis_name, next_rank)
+    prev_device_id = _mesh_device_id(mesh_axis_names, pcp_axis_name, prev_rank)
+
+    o_vmem_ref[...] = jnp.zeros_like(o_vmem_ref)
+    for block_idx in range(num_q_blocks):
+        zero_store = pltpu.make_async_copy(
+            src_ref=o_vmem_ref.at[:, :],
+            dst_ref=o_ref.at[
+                pl.ds(block_idx * q_block_size, q_block_size),
+                :,
+            ],
+            sem=local_dma_sem,
+        )
+        zero_store.start()
+        zero_store.wait()
+
+    for lane in range(num_lanes):
+        m = jnp.full((q_block_size, 1), -jnp.inf, dtype=jnp.float32)
+        l = jnp.zeros((q_block_size, 1), dtype=jnp.float32)
+        acc = jnp.zeros((q_block_size, q_vmem_ref.shape[1]),
+                        dtype=jnp.float32)
+
+        def _page_group_loop(group_idx, carry):
+            m, l, acc = carry
+            group_start = group_idx * pcp_size
+
+            _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
+                                sched_dma_sem, group_start)
+            q_hbm_offset = sched_vmem_ref[my_id, lane,
+                                          ScheduleField.Q_HBM_OFFSET]
+            q_hbm_offset = pl.multiple_of(q_hbm_offset, q_block_size)
+            group_is_first_kv = sched_vmem_ref[
+                my_id, lane, ScheduleField.IS_FIRST_KV] != 0
+            q_load = pltpu.make_async_copy(
+                src_ref=q_ref.at[
+                    pl.ds(q_hbm_offset, q_block_size),
+                    :,
+                ],
+                dst_ref=q_vmem_ref.at[:, :],
+                sem=local_dma_sem,
+            )
+            q_load.start()
+            q_load.wait()
+
+            _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
+                                sched_dma_sem, group_start + my_id)
+            local_page_idx = _source_page_idx_from_staged_schedule(
+                sched_vmem_ref, my_id, lane, pcp_size)
+            _load_local_kv_page(
+                kv_cache_ref,
+                kv_vmem_ref,
+                local_dma_sem,
+                local_page_idx,
+                kv_head_idx=kv_head_idx,
+                kv_packing=kv_packing,
+                packed_kv_cache=packed_kv_cache,
+            )
+
+            util.local_barrier(prev_device_id, next_device_id)
+
+            m = jnp.where(group_is_first_kv,
+                          jnp.full_like(m, -jnp.inf),
+                          m)
+            l = jnp.where(group_is_first_kv, jnp.zeros_like(l), l)
+            acc = jnp.where(group_is_first_kv, jnp.zeros_like(acc), acc)
+            group_has_last = jnp.array(False)
+
+            for round_idx in range(pcp_size):
+                curr_slot = round_idx % 2
+                next_slot = 1 - curr_slot
+                src_rank = lax.rem(my_id + pcp_size - round_idx, pcp_size)
+
+                _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
+                                    sched_dma_sem, group_start + src_rank)
+                group_has_last = jnp.logical_or(
+                    group_has_last,
+                    sched_vmem_ref[my_id, lane,
+                                   ScheduleField.IS_LAST_KV] != 0,
+                )
+
+                if round_idx < pcp_size - 1:
+                    remote_op = pltpu.make_async_remote_copy(
+                        src_ref=kv_vmem_ref.at[curr_slot],
+                        dst_ref=kv_vmem_ref.at[next_slot],
+                        send_sem=remote_send_sems.at[lane, round_idx],
+                        recv_sem=remote_recv_sems.at[lane, round_idx],
+                        device_id=next_device_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                    remote_op.start()
+
+                m, l, acc = _consume_scheduled_kv_page(
+                    q_vmem_ref,
+                    kv_vmem_ref,
+                    sched_vmem_ref,
+                    curr_slot,
+                    my_id,
+                    lane,
+                    m,
+                    l,
+                    acc,
+                    sm_scale=sm_scale,
+                    pcp_size=pcp_size,
+                )
+
+                if round_idx < pcp_size - 1:
+                    remote_op.wait()
+                    util.local_barrier(prev_device_id, next_device_id)
+
+            l_broadcast = jnp.broadcast_to(l, acc.shape)
+            o_vmem_ref[...] = jnp.where(l_broadcast > 0, acc / l_broadcast,
+                                        0.0).astype(
+                o_vmem_ref.dtype)
+            _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
+                                sched_dma_sem, group_start)
+            req_id = sched_vmem_ref[my_id, lane, ScheduleField.REQ_ID]
+            o_hbm_offset = sched_vmem_ref[my_id, lane,
+                                          ScheduleField.O_HBM_OFFSET]
+            o_hbm_offset = pl.multiple_of(o_hbm_offset, q_block_size)
+
+            @pl.when(jnp.logical_and(req_id != -1, group_has_last))
+            def _store_output():
+                o_store = pltpu.make_async_copy(
+                    src_ref=o_vmem_ref.at[:, :],
+                    dst_ref=o_ref.at[
+                        pl.ds(o_hbm_offset, q_block_size),
+                        :,
+                    ],
+                    sem=local_dma_sem,
+                )
+                o_store.start()
+                o_store.wait()
+
+            return m, l, acc
+
+        active_page_groups = jnp.minimum(active_page_groups_ref[0],
+                                         num_page_groups)
+        m, l, acc = lax.fori_loop(
+            0,
+            active_page_groups,
+            _page_group_loop,
+            (m, l, acc),
+            unroll=False,
+        )
+
+
+def _pcp_streaming_attention_page_groups_multi_head_kernel(
+    active_page_groups_ref,
+    q_ref,
+    kv_cache_ref,
+    packed_schedule_ref,
+    o_ref,
+    sched_dma_sem,
+    local_dma_sem,
+    remote_send_sems,
+    remote_recv_sems,
+    sched_vmem_ref,
+    q_vmem_ref,
+    kv_vmem_ref,
+    o_vmem_ref,
+    l_ref,
+    m_ref,
+    acc_ref,
+    *,
+    pcp_size,
+    num_lanes,
+    q_block_size,
+    num_page_groups,
+    num_q_blocks,
+    sm_scale,
+    kv_heads,
+    kv_packing,
+    kv_pages_per_block,
+    mesh_axis_names,
+    pcp_axis_name,
+    q_compute_size,
+    kv_compute_size,
+):
+    """Pallas kernel for multi-head PCP streaming page groups.
+
+    Args:
+        active_page_groups_ref: HBM reference of the active page group count.
+        q_ref: HBM reference of queries.
+        kv_cache_ref: HBM reference of local key/value cache.
+        packed_schedule_ref: HBM reference of step schedules.
+        o_ref: HBM reference of output attention.
+        sched_dma_sem: DMA semaphore for loading schedule.
+        local_dma_sem: DMA semaphore for local transfers.
+        remote_send_sems: DMA semaphores for remote sends.
+        remote_recv_sems: DMA semaphores for remote receives.
+        sched_vmem_ref: VMEM reference for step schedules.
+        q_vmem_ref: VMEM reference for query tiles.
+        kv_vmem_ref: VMEM reference for key/value cache tiles.
+        o_vmem_ref: VMEM reference for output tiles.
+        l_ref: VMEM reference to scratch buffer for flash attention 'l'.
+        m_ref: VMEM reference to scratch buffer for flash attention 'm'.
+        acc_ref: VMEM reference to scratch buffer for flash attention accumulated output.
+        pcp_size: Physical device ring/topology size.
+        num_lanes: Number of lanes.
+        q_block_size: Size of a query tile.
+        num_page_groups: Total number of page groups.
+        num_q_blocks: Number of query blocks.
+        sm_scale: Softmax scale factor.
+        kv_heads: Number of local key/value heads.
+        kv_packing: Pack count for key/value.
+        kv_pages_per_block: Number of pages in each cache block.
+        mesh_axis_names: Names of mesh axis.
+        pcp_axis_name: Name of the PCP axis.
+    """
+    my_id = lax.axis_index(pcp_axis_name)
+    next_rank = lax.rem(my_id + 1, pcp_size)
+    prev_rank = lax.rem(my_id + pcp_size - 1, pcp_size)
+    next_device_id = _mesh_device_id(mesh_axis_names, pcp_axis_name, next_rank)
+    prev_device_id = _mesh_device_id(mesh_axis_names, pcp_axis_name, prev_rank)
+
+    for lane in range(num_lanes):
+        l_ref[...] = jnp.zeros_like(l_ref)
+        m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+        acc_ref[...] = jnp.zeros_like(acc_ref)
+
+        def _page_group_loop(group_idx, carry):
+            group_start = group_idx * pcp_size
+
+            _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
+                                sched_dma_sem, group_start)
+            q_hbm_offset = sched_vmem_ref[my_id, lane,
+                                          ScheduleField.Q_HBM_OFFSET]
+            q_hbm_offset = pl.multiple_of(q_hbm_offset, q_block_size)
+            group_is_first_kv = sched_vmem_ref[
+                my_id, lane, ScheduleField.IS_FIRST_KV] != 0
+            group_req_id = sched_vmem_ref[my_id, lane, ScheduleField.REQ_ID]
+            group_o_hbm_offset = sched_vmem_ref[my_id, lane,
+                                                ScheduleField.O_HBM_OFFSET]
+            group_load_q = sched_vmem_ref[my_id, lane,
+                                          ScheduleField.LOAD_Q] != 0
+
+            @pl.when(group_load_q)
+            def _load_q_tile():
+                q_load = pltpu.make_async_copy(
+                    src_ref=q_ref.at[
+                        pl.ds(q_hbm_offset, q_block_size),
+                        :,
+                        :,
+                        :,
+                    ],
+                    dst_ref=q_vmem_ref.at[:, :, :, :],
+                    sem=local_dma_sem,
+                )
+                q_load.start()
+                q_load.wait()
+
+            _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
+                                sched_dma_sem, group_start + my_id)
+            _load_local_kv_page_block_all_heads_packed(
+                kv_cache_ref,
+                kv_vmem_ref,
+                local_dma_sem,
+                sched_vmem_ref,
+                my_id,
+                lane,
+                pcp_size=pcp_size,
+                kv_heads=kv_heads,
+                kv_packing=kv_packing,
+                kv_pages_per_block=kv_pages_per_block,
+            )
+
+            util.local_barrier(prev_device_id, next_device_id)
+
+            @pl.when(group_is_first_kv)
+            def _reset_states():
+                l_ref[...] = jnp.zeros_like(l_ref)
+                m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+                acc_ref[...] = jnp.zeros_like(acc_ref)
+
+            group_has_last = jnp.array(False)
+
+            def _pcp_loop_body(round_idx, carry):
+                group_has_last = carry
+                curr_slot = round_idx % 2
+                next_slot = 1 - curr_slot
+                src_rank = lax.rem(my_id + pcp_size - round_idx, pcp_size)
+
+                @pl.when(round_idx > 0)
+                def _do_load_schedule():
+                    _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
+                                        sched_dma_sem, group_start + src_rank)
+                group_has_last = jnp.logical_or(
+                    group_has_last,
+                    sched_vmem_ref[my_id, lane,
+                                   ScheduleField.IS_LAST_KV] != 0,
+                )
+
+                @pl.when(round_idx < pcp_size - 1)
+                def _remote_copy_start():
+                    remote_op = pltpu.make_async_remote_copy(
+                        src_ref=kv_vmem_ref.at[curr_slot],
+                        dst_ref=kv_vmem_ref.at[next_slot],
+                        send_sem=remote_send_sems.at[lane, round_idx],
+                        recv_sem=remote_recv_sems.at[lane, round_idx],
+                        device_id=next_device_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                    remote_op.start()
+
+                # print("!!!!!SKIP RDMA!!!!!")
+                _consume_scheduled_kv_page_multi_head(
+                    q_vmem_ref,
+                    kv_vmem_ref,
+                    sched_vmem_ref,
+                    curr_slot,
+                    my_id,
+                    lane,
+                    l_ref,
+                    m_ref,
+                    acc_ref,
+                    sm_scale=sm_scale,
+                    pcp_size=pcp_size,
+                    q_compute_size=q_compute_size,
+                    kv_compute_size=kv_compute_size,
+                )
+
+                @pl.when(round_idx < pcp_size - 1)
+                def _remote_copy_wait():
+                    remote_op = pltpu.make_async_remote_copy(
+                        src_ref=kv_vmem_ref.at[curr_slot],
+                        dst_ref=kv_vmem_ref.at[next_slot],
+                        send_sem=remote_send_sems.at[lane, round_idx],
+                        recv_sem=remote_recv_sems.at[lane, round_idx],
+                        device_id=next_device_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                    remote_op.wait()
+                    util.local_barrier(prev_device_id, next_device_id)
+
+                return group_has_last
+
+            group_has_last = lax.fori_loop(
+                0,
+                pcp_size,
+                _pcp_loop_body,
+                init_val=group_has_last,
+                unroll=False,
+            )
+
+            q_per_kv = q_vmem_ref.shape[2]
+            head_dim = q_vmem_ref.shape[3]
+            acc = acc_ref[...].reshape(kv_heads, q_block_size, q_per_kv, head_dim)
+            acc = jnp.swapaxes(acc, 0, 1)
+
+            l = l_ref[..., 0].reshape(kv_heads, q_block_size, q_per_kv)
+            l = jnp.swapaxes(l, 0, 1)
+            l = l[..., None]
+
+            l_broadcast = jnp.broadcast_to(l, acc.shape)
+            o_vmem_ref[...] = jnp.where(l_broadcast > 0, acc / l_broadcast,
+                                        0.0).astype(o_vmem_ref.dtype)
+            group_o_hbm_offset = pl.multiple_of(group_o_hbm_offset,
+                                                q_block_size)
+
+            @pl.when(jnp.logical_and(group_req_id != -1, group_has_last))
+            def _store_output():
+                o_store = pltpu.make_async_copy(
+                    src_ref=o_vmem_ref.at[:, :, :, :],
+                    dst_ref=o_ref.at[
+                        pl.ds(group_o_hbm_offset, q_block_size),
+                        :,
+                        :,
+                        :,
+                    ],
+                    sem=local_dma_sem,
+                )
+                o_store.start()
+                o_store.wait()
+
+            return carry
+
+        active_page_groups = jnp.minimum(active_page_groups_ref[0],
+                                         num_page_groups)
+        lax.fori_loop(
+            0,
+            active_page_groups,
+            _page_group_loop,
+            0,
+            unroll=False,
+        )
+
+
+def _validate_page_group_inputs(q_by_rank, kv_cache_by_rank, packed_schedule,
+                                pcp_size, q_block_size):
+    if q_by_rank.ndim != 5:
+        raise ValueError("q_by_rank must have shape "
+                         "[pcp, local_tokens, kv_heads, q_per_kv, head_dim].")
+    if kv_cache_by_rank.ndim != 6:
+        raise ValueError("kv_cache_by_rank must have shape "
+                         "[pcp, pages, page_size, kv_heads, 2, head_dim].")
+    if packed_schedule.ndim != 4:
+        raise ValueError("packed_schedule must have shape "
+                         "[steps, pcp, lanes, packed_fields].")
+    if q_by_rank.shape[0] != pcp_size or kv_cache_by_rank.shape[0] != pcp_size:
+        raise ValueError("q_by_rank and kv_cache_by_rank must be sharded over "
+                         "pcp_size ranks.")
+    if q_block_size <= 0:
+        raise ValueError("q_block_size must be positive.")
+    if q_by_rank.shape[1] % q_block_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires local_tokens to be a multiple of "
+            "q_block_size.")
+    if packed_schedule.shape[0] % pcp_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires schedule steps to be grouped in "
+            "pcp_size-step ring groups.")
+    if packed_schedule.shape[1] != pcp_size or packed_schedule.shape[2] <= 0:
+        raise NotImplementedError(
+            "page-group MVP requires at least one lane.")
+    if packed_schedule.shape[3] != ScheduleField.PACKED_NUM_FIELDS:
+        raise ValueError("packed_schedule must use padded packed fields.")
+    if q_by_rank.shape[2] != 1 or q_by_rank.shape[3] != 1:
+        raise NotImplementedError(
+            "page-group MVP supports kv_heads=1 and q_per_kv=1.")
+    if kv_cache_by_rank.shape[3] != 1 or kv_cache_by_rank.shape[4] != 2:
+        raise NotImplementedError(
+            "page-group MVP expects KV cache shape [..., 1, 2, head_dim]."
+        )
+    if q_by_rank.shape[-1] != kv_cache_by_rank.shape[-1]:
+        raise ValueError("Q and KV head_dim must match.")
+    if q_by_rank.shape[-1] % 128 != 0:
+        raise NotImplementedError(
+            "page-group MVP requires head_dim to be 128-aligned.")
+
+
+def _validate_common_page_group_inputs(q_by_rank, kv_cache_by_rank,
+                                       packed_schedule, pcp_size,
+                                       q_block_size):
+    if q_by_rank.ndim != 5:
+        raise ValueError("q_by_rank must have shape "
+                         "[pcp, local_tokens, kv_heads, q_per_kv, head_dim].")
+    if kv_cache_by_rank.ndim != 6:
+        raise ValueError("kv_cache_by_rank must have shape "
+                         "[pcp, pages, page_size, kv_heads, 2, head_dim].")
+    if packed_schedule.ndim != 4:
+        raise ValueError("packed_schedule must have shape "
+                         "[steps, pcp, lanes, packed_fields].")
+    if q_by_rank.shape[0] != pcp_size or kv_cache_by_rank.shape[0] != pcp_size:
+        raise ValueError("q_by_rank and kv_cache_by_rank must be sharded over "
+                         "pcp_size ranks.")
+    if q_block_size <= 0:
+        raise ValueError("q_block_size must be positive.")
+    if q_by_rank.shape[1] % q_block_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires local_tokens to be a multiple of "
+            "q_block_size.")
+    if packed_schedule.shape[0] % pcp_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires schedule steps to be grouped in "
+            "pcp_size-step ring groups.")
+    if packed_schedule.shape[1] != pcp_size or packed_schedule.shape[2] <= 0:
+        raise NotImplementedError(
+            "page-group MVP requires at least one lane.")
+    if packed_schedule.shape[3] != ScheduleField.PACKED_NUM_FIELDS:
+        raise ValueError("packed_schedule must use padded packed fields.")
+    if kv_cache_by_rank.shape[3] != q_by_rank.shape[2]:
+        raise ValueError("Q kv_heads and KV kv_heads must match.")
+    if kv_cache_by_rank.shape[4] != 2:
+        raise ValueError("KV cache must store K/V pair at axis 4.")
+    if q_by_rank.shape[-1] != kv_cache_by_rank.shape[-1]:
+        raise ValueError("Q and KV head_dim must match.")
+    if q_by_rank.shape[-1] % 128 != 0:
+        raise NotImplementedError(
+            "page-group MVP requires head_dim to be 128-aligned.")
+
+
+def _validate_common_page_group_local_inputs(q_local, kv_cache_local,
+                                             packed_schedule, pcp_size,
+                                             q_block_size):
+    if q_local.ndim != 4:
+        raise ValueError("q_local must have shape "
+                         "[local_tokens, kv_heads, q_per_kv, head_dim].")
+    if kv_cache_local.ndim != 5:
+        raise ValueError("kv_cache_local must have shape "
+                         "[pages, page_size, kv_heads, 2, head_dim].")
+    if packed_schedule.ndim != 4:
+        raise ValueError("packed_schedule must have shape "
+                         "[steps, pcp, lanes, packed_fields].")
+    if q_block_size <= 0:
+        raise ValueError("q_block_size must be positive.")
+    if q_local.shape[0] % q_block_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires local_tokens to be a multiple of "
+            "q_block_size.")
+    if packed_schedule.shape[0] % pcp_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires schedule steps to be grouped in "
+            "pcp_size-step ring groups.")
+    if packed_schedule.shape[1] != pcp_size or packed_schedule.shape[2] <= 0:
+        raise NotImplementedError(
+            "page-group MVP requires at least one lane.")
+    if packed_schedule.shape[3] != ScheduleField.PACKED_NUM_FIELDS:
+        raise ValueError("packed_schedule must use padded packed fields.")
+    if kv_cache_local.shape[2] != q_local.shape[1]:
+        raise ValueError("Q kv_heads and KV kv_heads must match.")
+    if kv_cache_local.shape[3] != 2:
+        raise ValueError("KV cache must store K/V pair at axis 3.")
+    if q_local.shape[-1] != kv_cache_local.shape[-1]:
+        raise ValueError("Q and KV head_dim must match.")
+    if q_local.shape[-1] % 128 != 0:
+        raise NotImplementedError(
+            "page-group MVP requires head_dim to be 128-aligned.")
+
+
+def _validate_packed_page_group_local_inputs(q_local, kv_cache_local,
+                                             packed_schedule, pcp_size,
+                                             q_block_size):
+    if q_local.ndim != 4:
+        raise ValueError("q_local must have shape "
+                         "[local_tokens, kv_heads, q_per_kv, head_dim].")
+    if kv_cache_local.ndim != 5:
+        raise ValueError("kv_cache_local must have shape "
+                         "[pages, page_size, packed_kv_heads_x2, "
+                         "kv_packing, head_dim].")
+    if packed_schedule.ndim != 4:
+        raise ValueError("packed_schedule must have shape "
+                         "[steps, pcp, lanes, packed_fields].")
+    if q_block_size <= 0:
+        raise ValueError("q_block_size must be positive.")
+    if q_local.shape[0] % q_block_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires local_tokens to be a multiple of "
+            "q_block_size.")
+    if packed_schedule.shape[0] % pcp_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires schedule steps to be grouped in "
+            "pcp_size-step ring groups.")
+    if packed_schedule.shape[1] != pcp_size or packed_schedule.shape[2] <= 0:
+        raise NotImplementedError(
+            "page-group MVP requires at least one lane.")
+    if packed_schedule.shape[3] != ScheduleField.PACKED_NUM_FIELDS:
+        raise ValueError("packed_schedule must use padded packed fields.")
+    if q_local.shape[-1] != kv_cache_local.shape[-1]:
+        raise ValueError("Q and KV head_dim must match.")
+    if q_local.shape[-1] % 128 != 0:
+        raise NotImplementedError(
+            "page-group MVP requires head_dim to be 128-aligned.")
+    expected_packing = get_dtype_packing(kv_cache_local.dtype)
+    if kv_cache_local.shape[3] != expected_packing:
+        raise ValueError("kv_cache_local packing axis does not match dtype "
+                         f"packing: got {kv_cache_local.shape[3]} vs "
+                         f"{expected_packing}.")
+    if kv_cache_local.shape[3] not in (1, 2):
+        raise NotImplementedError(
+            "packed PCP streaming KV loads currently support kv_packing in "
+            "{1, 2}.")
+    if kv_cache_local.shape[2] * kv_cache_local.shape[3] < q_local.shape[1] * 2:
+        raise ValueError("packed KV cache does not contain all local K/V heads.")
+
+
+def _pcp_streaming_attention_page_groups_single_head_pallas_call(
+    q_single_head,
+    kv_cache_single_head,
+    packed_schedule,
+    active_page_groups=None,
+    *,
+    pcp_size: int,
+    q_block_size: int,
+    sm_scale: float,
+    collective_id: int | None,
+    kv_head_idx: int = 0,
+    kv_packing: int = 1,
+    packed_kv_cache: bool = False,
+    mesh_axis_names: tuple[str, ...] = (AXIS, ),
+    pcp_axis_name: str = AXIS,
+):
+    page_size = kv_cache_single_head.shape[2]
+    head_dim = q_single_head.shape[-1]
+    num_page_groups = packed_schedule.shape[0] // pcp_size
+    num_lanes = packed_schedule.shape[2]
+    num_q_blocks = q_single_head.shape[0] // q_block_size
+    if active_page_groups is None:
+        active_page_groups = jnp.array([num_page_groups], dtype=jnp.int32)
+    else:
+        active_page_groups = jnp.asarray(active_page_groups, dtype=jnp.int32)
+        if active_page_groups.shape == ():
+            active_page_groups = active_page_groups[None]
+
+    return pl.pallas_call(
+        functools.partial(
+            _pcp_streaming_attention_page_groups_kernel,
+            pcp_size=pcp_size,
+            num_lanes=num_lanes,
+            q_block_size=q_block_size,
+            num_page_groups=num_page_groups,
+            num_q_blocks=num_q_blocks,
+            sm_scale=sm_scale,
+            kv_head_idx=kv_head_idx,
+            kv_packing=kv_packing,
+            packed_kv_cache=packed_kv_cache,
+            mesh_axis_names=mesh_axis_names,
+            pcp_axis_name=pcp_axis_name,
+        ),
+        out_shape=jax.ShapeDtypeStruct(
+            (q_single_head.shape[0], head_dim),
+            q_single_head.dtype,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            scratch_shapes=(
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA((num_lanes, pcp_size - 1)),
+                pltpu.SemaphoreType.DMA((num_lanes, pcp_size - 1)),
+                pltpu.VMEM((pcp_size, num_lanes,
+                            ScheduleField.PACKED_NUM_FIELDS),
+                           packed_schedule.dtype),
+                pltpu.VMEM((q_block_size, head_dim), q_single_head.dtype),
+                pltpu.VMEM((2, page_size, 2, head_dim),
+                           kv_cache_single_head.dtype),
+                pltpu.VMEM((q_block_size, head_dim), q_single_head.dtype),
+            ),
+            grid=(1, ),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=collective_id,
+            vmem_limit_bytes=_pcp_streaming_vmem_limit_bytes(),
+        ),
+        name="pcp_streaming_attention_page_groups",
+    )(active_page_groups, q_single_head, kv_cache_single_head, packed_schedule)
+
+
+def _pcp_streaming_attention_page_groups_multi_head_pallas_call(
+    q_multi_head,
+    kv_cache_local,
+    packed_schedule,
+    active_page_groups=None,
+    *,
+    pcp_size: int,
+    q_block_size: int,
+    sm_scale: float,
+    collective_id: int | None,
+    kv_packing: int,
+    kv_pages_per_block: int = 1,
+    mesh_axis_names: tuple[str, ...] = (AXIS, ),
+    pcp_axis_name: str = AXIS,
+    q_compute_size: int,
+    kv_compute_size: int,
+):
+    """Pallas call wrapper for multi-head PCP streaming page groups.
+
+    Args:
+        q_multi_head: Query states.
+        kv_cache_local: Local key/value cache block.
+        packed_schedule: Packed schedules.
+        active_page_groups: Optional list of active page group counts.
+        pcp_size: Physical device ring/topology size.
+        q_block_size: Size of a query tile.
+        sm_scale: Softmax scale factor.
+        collective_id: Optional collective operation ID.
+        kv_packing: Pack count for key/value cache.
+        kv_pages_per_block: Number of pages per cache block.
+        mesh_axis_names: Names of mesh axis.
+        pcp_axis_name: Name of the PCP axis.
+        q_compute_size: The chunk size for tiling queries (default: 512).
+        kv_compute_size: The chunk size for tiling keys and values (default: 512).
+    """
+    page_size = kv_cache_local.shape[2]
+    kv_heads = q_multi_head.shape[1]
+    q_per_kv = q_multi_head.shape[2]
+    head_dim = q_multi_head.shape[-1]
+    num_page_groups = packed_schedule.shape[0] // pcp_size
+    num_lanes = packed_schedule.shape[2]
+    num_q_blocks = q_multi_head.shape[0] // q_block_size
+    if active_page_groups is None:
+        active_page_groups = jnp.array([num_page_groups], dtype=jnp.int32)
+    else:
+        active_page_groups = jnp.asarray(active_page_groups, dtype=jnp.int32)
+        if active_page_groups.shape == ():
+            active_page_groups = active_page_groups[None]
+
+    actual_num_kv_heads = kv_heads
+    bq_sz = q_block_size
+    num_q_heads_per_kv_head = q_per_kv
+    out_dtype = q_multi_head.dtype
+
+    l_scratch = pltpu.VMEM(
+        (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
+        out_dtype,
+    )
+    m_scratch = l_scratch
+
+    acc_scratch = pltpu.VMEM(
+        (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
+        out_dtype,
+    )
+
+    return pl.pallas_call(
+        functools.partial(
+            _pcp_streaming_attention_page_groups_multi_head_kernel,
+            pcp_size=pcp_size,
+            num_lanes=num_lanes,
+            q_block_size=q_block_size,
+            num_page_groups=num_page_groups,
+            num_q_blocks=num_q_blocks,
+            sm_scale=sm_scale,
+            kv_heads=kv_heads,
+            kv_packing=kv_packing,
+            kv_pages_per_block=kv_pages_per_block,
+            mesh_axis_names=mesh_axis_names,
+            pcp_axis_name=pcp_axis_name,
+            q_compute_size=q_compute_size,
+            kv_compute_size=kv_compute_size,
+        ),
+        out_shape=jax.ShapeDtypeStruct(
+            q_multi_head.shape,
+            q_multi_head.dtype,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            scratch_shapes=(
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA((num_lanes, pcp_size - 1)),
+                pltpu.SemaphoreType.DMA((num_lanes, pcp_size - 1)),
+                pltpu.VMEM((pcp_size, num_lanes,
+                            ScheduleField.PACKED_NUM_FIELDS),
+                           packed_schedule.dtype),
+                pltpu.VMEM((q_block_size, kv_heads, q_per_kv, head_dim),
+                           q_multi_head.dtype),
+                pltpu.VMEM((2, kv_pages_per_block, page_size, kv_heads, 2,
+                            head_dim),
+                           kv_cache_local.dtype),
+                pltpu.VMEM((q_block_size, kv_heads, q_per_kv, head_dim),
+                           q_multi_head.dtype),
+                l_scratch,
+                m_scratch,
+                acc_scratch,
+            ),
+            grid=(1, ),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=collective_id,
+            vmem_limit_bytes=_pcp_streaming_vmem_limit_bytes(),
+        ),
+        name="pcp_streaming_attention_page_groups_multi_head",
+    )(active_page_groups, q_multi_head, kv_cache_local, packed_schedule)
+
+
+def pcp_streaming_attention_page_groups_local(
+    q_local,
+    kv_cache_local,
+    packed_schedule,
+    active_page_groups=None,
+    *,
+    pcp_size: int,
+    q_block_size: int,
+    sm_scale: float,
+    collective_id: int | None = 13,
+    mesh_axis_names: tuple[str, ...] = (AXIS, ),
+    pcp_axis_name: str = AXIS,
+):
+    """Run PCP streaming page groups inside an existing PCP shard_map.
+
+    Args:
+        q_local: [local_tokens, kv_heads, q_per_kv, head_dim] for one PCP rank.
+        kv_cache_local: [pages, page_size, kv_heads, 2, head_dim] for one rank.
+        packed_schedule: Replicated [steps, pcp, lanes, 128] schedule.
+
+    Returns:
+        Local rank output with the same shape as q_local.
+    """
+    _validate_common_page_group_local_inputs(q_local, kv_cache_local,
+                                             packed_schedule, pcp_size,
+                                             q_block_size)
+    kv_heads = q_local.shape[1]
+    q_per_kv = q_local.shape[2]
+    head_outputs = []
+    for kv_head_idx in range(kv_heads):
+        q_head_outputs = []
+        kv_slice = kv_cache_local[:, :, kv_head_idx:kv_head_idx + 1]
+        for q_head_idx in range(q_per_kv):
+            q_slice = q_local[:, kv_head_idx:kv_head_idx + 1,
+                              q_head_idx:q_head_idx + 1]
+            if collective_id is None:
+                head_collective_id = None
+            else:
+                head_collective_id = (collective_id + kv_head_idx * q_per_kv +
+                                      q_head_idx)
+            out = _pcp_streaming_attention_page_groups_single_head_pallas_call(
+                q_slice[:, 0, 0, :],
+                kv_slice[None, ...],
+                packed_schedule,
+                active_page_groups,
+                pcp_size=pcp_size,
+                q_block_size=q_block_size,
+                sm_scale=sm_scale,
+                collective_id=head_collective_id,
+                mesh_axis_names=mesh_axis_names,
+                pcp_axis_name=pcp_axis_name,
+            )
+            q_head_outputs.append(out[:, None, None, :])
+        head_outputs.append(jnp.concatenate(q_head_outputs, axis=2))
+    return jnp.concatenate(head_outputs, axis=1)
+
+
+def pcp_streaming_attention_page_groups_packed_local(
+    q_local,
+    kv_cache_local,
+    packed_schedule,
+    active_page_groups=None,
+    *,
+    pcp_size: int,
+    q_block_size: int,
+    sm_scale: float,
+    collective_id: int | None = 13,
+    kv_pages_per_block: int = 1,
+    mesh_axis_names: tuple[str, ...] = (AXIS, ),
+    pcp_axis_name: str = AXIS,
+    q_compute_size: int = 512,
+    kv_compute_size: int = 512,
+):
+    """Run PCP streaming page groups on batched-RPA packed KV cache layout.
+
+    Args:
+        q_local: [local_tokens, kv_heads, q_per_kv, head_dim] for one PCP rank.
+        kv_cache_local: [pages, page_size, packed_kv_heads_x2, kv_packing,
+            head_dim] for one rank.
+        packed_schedule: Replicated [steps, pcp, lanes, 128] schedule.
+
+    Returns:
+        Local rank output with the same shape as q_local.
+    """
+    _validate_packed_page_group_local_inputs(q_local, kv_cache_local,
+                                             packed_schedule, pcp_size,
+                                             q_block_size)
+    kv_heads = q_local.shape[1]
+    q_per_kv = q_local.shape[2]
+    kv_packing = kv_cache_local.shape[3]
+    if kv_packing == 2 and kv_heads >= 2 and q_per_kv >= 2:
+        return _pcp_streaming_attention_page_groups_multi_head_pallas_call(
+            q_local,
+            kv_cache_local[None, ...],
+            packed_schedule,
+            active_page_groups,
+            pcp_size=pcp_size,
+            q_block_size=q_block_size,
+            sm_scale=sm_scale,
+            collective_id=collective_id,
+            kv_packing=kv_packing,
+            kv_pages_per_block=kv_pages_per_block,
+            mesh_axis_names=mesh_axis_names,
+            pcp_axis_name=pcp_axis_name,
+            q_compute_size=q_compute_size,
+            kv_compute_size=kv_compute_size,
+        )
+
+    head_outputs = []
+    for kv_head_idx in range(kv_heads):
+        q_head_outputs = []
+        for q_head_idx in range(q_per_kv):
+            q_slice = q_local[:, kv_head_idx:kv_head_idx + 1,
+                              q_head_idx:q_head_idx + 1]
+            if collective_id is None:
+                head_collective_id = None
+            else:
+                head_collective_id = (collective_id + kv_head_idx * q_per_kv +
+                                      q_head_idx)
+            out = _pcp_streaming_attention_page_groups_single_head_pallas_call(
+                q_slice[:, 0, 0, :],
+                kv_cache_local[None, ...],
+                packed_schedule,
+                active_page_groups,
+                pcp_size=pcp_size,
+                q_block_size=q_block_size,
+                sm_scale=sm_scale,
+                collective_id=head_collective_id,
+                kv_head_idx=kv_head_idx,
+                kv_packing=kv_packing,
+                packed_kv_cache=True,
+                mesh_axis_names=mesh_axis_names,
+                pcp_axis_name=pcp_axis_name,
+            )
+            q_head_outputs.append(out[:, None, None, :])
+        head_outputs.append(jnp.concatenate(q_head_outputs, axis=2))
+    return jnp.concatenate(head_outputs, axis=1)
+
+
+def _pcp_streaming_attention_page_groups_single_head(
+    q_by_rank,
+    kv_cache_by_rank,
+    packed_schedule,
+    active_page_groups=None,
+    *,
+    pcp_size: int,
+    q_block_size: int,
+    sm_scale: float,
+    collective_id: int | None = 13,
+    mesh_axis_names: tuple[str, ...] = (AXIS, ),
+    pcp_axis_name: str = AXIS,
+):
+    """Run RingAttention-style PCP page groups.
+
+    Args:
+        q_by_rank: [pcp, local_tokens, 1, 1, head_dim].
+        kv_cache_by_rank: [pcp, pages, page_size, 1, 2, head_dim].
+        packed_schedule: [page_groups * pcp, pcp, lanes, 128] ring-grouped
+            schedule. Within each page group, step order is source-rank order.
+        pcp_size: Number of PCP ranks.
+        q_block_size: Static Q tile size consumed by each page group.
+        sm_scale: Attention softmax scale.
+        collective_id: Pallas collective id used by the local ring barrier.
+
+    Returns:
+        Rank-local packed output with the same shape as q_by_rank.
+    """
+    _validate_page_group_inputs(q_by_rank, kv_cache_by_rank, packed_schedule,
+                                pcp_size, q_block_size)
+
+    def _call(q, kv_cache, schedule):
+        out = _pcp_streaming_attention_page_groups_single_head_pallas_call(
+            q[0, :, 0, 0, :],
+            kv_cache,
+            schedule,
+            active_page_groups,
+            pcp_size=pcp_size,
+            q_block_size=q_block_size,
+            sm_scale=sm_scale,
+            collective_id=collective_id,
+            mesh_axis_names=mesh_axis_names,
+            pcp_axis_name=pcp_axis_name,
+        )
+        return out[None, :, None, None, :]
+
+    mesh = jax.sharding.Mesh(jax.local_devices()[:pcp_size], (AXIS, ))
+    shard_map_kernel = jax.jit(
+        jax.shard_map(
+            _call,
+            mesh=mesh,
+            in_specs=(
+                P(AXIS, None, None, None, None),
+                P(AXIS, None, None, None, None, None),
+                P(None, None, None, None),
+            ),
+            out_specs=P(AXIS, None, None, None, None),
+            check_vma=False,
+        ))
+    return shard_map_kernel(q_by_rank, kv_cache_by_rank, packed_schedule)
+
+
+def pcp_streaming_attention_page_groups(
+    q_by_rank,
+    kv_cache_by_rank,
+    packed_schedule,
+    active_page_groups=None,
+    *,
+    pcp_size: int,
+    q_block_size: int,
+    sm_scale: float,
+    collective_id: int | None = 13,
+    mesh_axis_names: tuple[str, ...] = (AXIS, ),
+    pcp_axis_name: str = AXIS,
+):
+    """Run RingAttention-style PCP page groups.
+
+    This wrapper supports multiple KV heads and Q heads per KV head by invoking
+    the single-head Pallas kernel for each head pair.
+    """
+    _validate_common_page_group_inputs(q_by_rank, kv_cache_by_rank,
+                                       packed_schedule, pcp_size,
+                                       q_block_size)
+    kv_heads = q_by_rank.shape[2]
+    q_per_kv = q_by_rank.shape[3]
+    if kv_heads == 1 and q_per_kv == 1:
+        return _pcp_streaming_attention_page_groups_single_head(
+            q_by_rank,
+            kv_cache_by_rank,
+            packed_schedule,
+            active_page_groups,
+            pcp_size=pcp_size,
+            q_block_size=q_block_size,
+            sm_scale=sm_scale,
+            collective_id=collective_id,
+            mesh_axis_names=mesh_axis_names,
+            pcp_axis_name=pcp_axis_name,
+        )
+
+    head_outputs = []
+    for kv_head_idx in range(kv_heads):
+        q_head_outputs = []
+        kv_slice = kv_cache_by_rank[:, :, :, kv_head_idx:kv_head_idx + 1]
+        for q_head_idx in range(q_per_kv):
+            q_slice = q_by_rank[:, :, kv_head_idx:kv_head_idx + 1,
+                                q_head_idx:q_head_idx + 1]
+            if collective_id is None:
+                head_collective_id = None
+            else:
+                head_collective_id = (collective_id + kv_head_idx * q_per_kv +
+                                      q_head_idx)
+            q_head_outputs.append(
+                _pcp_streaming_attention_page_groups_single_head(
+                    q_slice,
+                    kv_slice,
+                    packed_schedule,
+                    active_page_groups,
+                    pcp_size=pcp_size,
+                    q_block_size=q_block_size,
+                    sm_scale=sm_scale,
+                    collective_id=head_collective_id,
+                    mesh_axis_names=mesh_axis_names,
+                    pcp_axis_name=pcp_axis_name,
+                ))
+        head_outputs.append(jnp.concatenate(q_head_outputs, axis=3))
+    return jnp.concatenate(head_outputs, axis=2)
+
+
+def pcp_streaming_attention_single_page_group(
+    q_by_rank,
+    kv_cache_by_rank,
+    packed_schedule,
+    *,
+    pcp_size: int,
+    sm_scale: float,
+    collective_id: int | None = 13,
+    mesh_axis_names: tuple[str, ...] = (AXIS, ),
+    pcp_axis_name: str = AXIS,
+):
+    """Run one RingAttention-style PCP page group."""
+    if packed_schedule.shape[0] != pcp_size:
+        raise NotImplementedError(
+            "single-page-group wrapper requires exactly pcp_size schedule "
+            "steps.")
+    return pcp_streaming_attention_page_groups(
+        q_by_rank,
+        kv_cache_by_rank,
+        packed_schedule,
+        pcp_size=pcp_size,
+        q_block_size=q_by_rank.shape[1],
+        sm_scale=sm_scale,
+        collective_id=collective_id,
+        mesh_axis_names=mesh_axis_names,
+        pcp_axis_name=pcp_axis_name,
+    )
