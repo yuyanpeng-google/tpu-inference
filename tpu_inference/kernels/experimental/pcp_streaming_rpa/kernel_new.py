@@ -230,7 +230,8 @@ def _consume_scheduled_kv_page_multi_head(
                 k_chunk,
                 dimension_numbers=(([1], [1]), ([], [])),
                 preferred_element_type=jnp.float32,
-            )
+            ) 
+            scores = scores * sm_scale
         with maybe_named_scope("pos"):
             q_row_idx = q_start + lax.broadcasted_iota(jnp.int32, scores.shape, 0)
             q_token_idx = lax.div(q_row_idx, q_per_kv)
@@ -289,7 +290,7 @@ def _consume_scheduled_kv_page_multi_head(
             acc_next = broadcast_minor(alpha, acc_prev.shape) * acc_prev + pv
             acc_slice[...] = acc_next.astype(acc_slice.dtype)
 
-    q = q_vmem_ref[...]
+    q = q_vmem_ref[...].astype(jnp.float32)
 
     q_global_start = sched_vmem_ref[consumer_rank, lane,
                                     ScheduleField.Q_GLOBAL_START]
@@ -333,8 +334,8 @@ def _consume_scheduled_kv_page_multi_head(
         )
         k_uint32 = kv_head_loaded[:, :head_dim // 2]
         v_uint32 = kv_head_loaded[:, head_dim // 2:]
-        k_full = pltpu.bitcast(k_uint32, q_vmem_ref.dtype)
-        v_full = pltpu.bitcast(v_uint32, q_vmem_ref.dtype)
+        k_full = pltpu.bitcast(k_uint32, q_vmem_ref.dtype).astype(jnp.float32)
+        v_full = pltpu.bitcast(v_uint32, q_vmem_ref.dtype).astype(jnp.float32)
         k_full = k_full.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
         v_full = v_full.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
 
