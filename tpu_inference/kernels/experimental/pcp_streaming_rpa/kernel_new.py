@@ -365,6 +365,11 @@ def _consume_scheduled_kv_page_multi_head(
                     kv_start=kv_start,
                 )
 
+                prev_p = cur_p
+                prev_v = cur_v
+                prev_alpha = cur_alpha
+                prev_acc_slice = acc_slice
+
                 if prev_p is not None:
                     flash_attention_step2_pv(
                         prev_p,
@@ -373,18 +378,13 @@ def _consume_scheduled_kv_page_multi_head(
                         prev_acc_slice,
                     )
 
-                prev_p = cur_p
-                prev_v = cur_v
-                prev_alpha = cur_alpha
-                prev_acc_slice = acc_slice
-
-    if prev_p is not None:
-        flash_attention_step2_pv(
-            prev_p,
-            prev_v,
-            prev_alpha,
-            prev_acc_slice,
-        )
+    # if prev_p is not None:
+    #     flash_attention_step2_pv(
+    #         prev_p,
+    #         prev_v,
+    #         prev_alpha,
+    #         prev_acc_slice,
+    #     )
 
 
 def _load_schedule_step(packed_schedule_ref, sched_vmem_ref, sem, step):
