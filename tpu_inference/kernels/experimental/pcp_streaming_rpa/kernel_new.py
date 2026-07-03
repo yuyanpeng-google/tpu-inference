@@ -230,7 +230,7 @@ def _consume_scheduled_kv_page_multi_head(
                 k_chunk,
                 dimension_numbers=(([1], [1]), ([], [])),
                 preferred_element_type=jnp.float32,
-            ) 
+            )
             scores = scores * sm_scale
         with maybe_named_scope("pos"):
             q_row_idx = q_start + lax.broadcasted_iota(jnp.int32, scores.shape, 0)
@@ -290,7 +290,8 @@ def _consume_scheduled_kv_page_multi_head(
             acc_next = broadcast_minor(alpha, acc_prev.shape) * acc_prev + pv
             acc_slice[...] = acc_next.astype(acc_slice.dtype)
 
-    q = q_vmem_ref[...].astype(jnp.float32)
+    # q_vmem_ref.shape=(512, 2, 16, 256), kv_vmem_ref.shape=(2, 8, 32, 2, 2, 256)
+    q = q_vmem_ref[...]
 
     q_global_start = sched_vmem_ref[consumer_rank, lane,
                                     ScheduleField.Q_GLOBAL_START]
@@ -315,7 +316,7 @@ def _consume_scheduled_kv_page_multi_head(
 
     head_dim = q_vmem_ref.shape[-1]
     kv_heads = kv_vmem_ref.shape[3]
-    kv_ref = kv_vmem_ref.at[slot].bitcast(jnp.uint32)
+    kv_ref = kv_vmem_ref.bitcast(jnp.uint32).at[slot]
     kv_flat_ref = kv_ref.reshape(kv_block_tokens * kv_heads, head_dim)
 
     prev_p = None
@@ -332,10 +333,12 @@ def _consume_scheduled_kv_page_multi_head(
             sz=kv_block_tokens * kv_heads,
             step=kv_heads,
         )
-        k_uint32 = kv_head_loaded[:, :head_dim // 2]
-        v_uint32 = kv_head_loaded[:, head_dim // 2:]
-        k_full = pltpu.bitcast(k_uint32, q_vmem_ref.dtype).astype(jnp.float32)
-        v_full = pltpu.bitcast(v_uint32, q_vmem_ref.dtype).astype(jnp.float32)
+        k_uint32 = kv_head_loaded >> 0
+        v_uint32 = kv_head_loaded >> 16
+        repack_ty = jnp.dtype("uint16")
+        k_full = pltpu.bitcast(k_uint32.astype(repack_ty), q_vmem_ref.dtype)
+        v_full = pltpu.bitcast(v_uint32.astype(repack_ty), q_vmem_ref.dtype)
+
         k_full = k_full.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
         v_full = v_full.reshape(kv_block_tokens, q_vmem_ref.shape[-1])
 
