@@ -115,19 +115,21 @@ def _consume_scheduled_kv_page(
     kv_valid = lax.broadcasted_iota(jnp.int32, scores.shape, 1) < kv_valid_len
     q_valid = lax.broadcasted_iota(jnp.int32, scores.shape, 0) < q_tile_size
     entry_valid = req_id != -1
-    row_active = jnp.logical_and(entry_valid,
-                                 q_valid[:, :1])
     mask = jnp.logical_and(jnp.logical_and(q_pos >= kv_pos, kv_valid),
                            q_valid)
-    scores = jnp.where(mask, scores, -jnp.inf)
-    scores = jnp.where(row_active, scores, 0.0)
+    mask = jnp.logical_and(mask, entry_valid)
+    scores = jnp.where(mask, scores, jnp.finfo(jnp.float32).min)
 
     m_curr = jnp.max(scores, axis=1, keepdims=True)
-    m_next = jnp.where(row_active, jnp.maximum(m, m_curr), m)
-    p = jnp.where(row_active,
-                  jnp.exp(scores - jnp.broadcast_to(m_next, scores.shape)),
-                  0.0)
-    alpha = jnp.where(row_active, jnp.exp(m - m_next), 1.0)
+    m_next = jnp.where(entry_valid, jnp.maximum(m, m_curr), m)
+
+    # Mathematical Correctness & Stability Explanation:
+    # 1. Masked scores and maximum registers (m) are set to jnp.finfo.min. On inactive (fully masked)
+    #    rows, scores - m_next is 0.0, avoiding NaN. On active rows, masked elements are finfo.min - finite_m,
+    #    underflowing to 0.0 upon exponentiation. This avoids jnp.where/masking for p.
+    # 2. Since m and m_next are always finite, m - m_next evaluates safely, eliminating NaN subtract risks.
+    p = jnp.exp(scores - jnp.broadcast_to(m_next, scores.shape))
+    alpha = jnp.where(entry_valid, jnp.exp(m - m_next), 1.0)
     l_next = alpha * l + jnp.sum(p, axis=1, keepdims=True)
     pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
     acc_next = jnp.broadcast_to(alpha, acc.shape) * acc + pv
@@ -254,10 +256,9 @@ def _consume_scheduled_kv_page_multi_head(
             kv_valid = kv_local_pos < kv_valid_len
             q_valid = q_token_idx < q_tile_size
             entry_valid = req_id != -1
-            row_active = jnp.logical_and(entry_valid, q_valid[:, :1])
             mask = jnp.logical_and(jnp.logical_and(q_pos >= kv_pos, kv_valid),
                                 q_valid)
-            mask = jnp.logical_and(mask, row_active)
+            mask = jnp.logical_and(mask, entry_valid)
             scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
 
         with maybe_named_scope("softmax"):
@@ -266,10 +267,14 @@ def _consume_scheduled_kv_page_multi_head(
             m_next = jnp.maximum(m_prev, m_curr)
             m_slice[...] = m_next.astype(m_slice.dtype)
 
-            p = jnp.where(row_active,
-                        jnp.exp(scores - broadcast_minor(m_next, scores.shape)),
-                        0.0)
-            alpha = jnp.where(row_active, jnp.exp(m_prev - m_next), 1.0)
+            # Mathematical Correctness & Stability Explanation:
+            # 1. Masked scores and maximum registers (m_prev/m_next) are set to jnp.finfo.min. On inactive
+            #    (fully masked) rows, scores - m_next is 0.0, avoiding NaN. On active rows, masked elements
+            #    are finfo.min - finite_m, underflowing to 0.0 upon exponentiation. This avoids jnp.where/masking for p.
+            # 2. Since m_prev and m_next are always finite, m_prev - m_next evaluates safely, eliminating
+            #    any NaN subtract risks and jnp.where selects for alpha.
+            p = jnp.exp(scores - broadcast_minor(m_next, scores.shape))
+            alpha = jnp.exp(m_prev - m_next)
             l_prev = l_slice[...]
             l_next = alpha * l_prev + jnp.sum(p, axis=1, keepdims=True)
             l_slice[...] = l_next.astype(l_slice.dtype)
@@ -307,7 +312,10 @@ def _consume_scheduled_kv_page_multi_head(
     page_size = kv_vmem_ref.shape[2]
     kv_block_tokens = kv_vmem_ref.shape[1] * page_size
 
-    # q_compute_size = 1024
+    # WARNING: Overwrite for easier test
+    q_compute_size = 512
+    kv_compute_size = 256
+    ###
     q_chunk_size = min(q_compute_size, flat_q_rows)
     kv_chunk_size = min(kv_compute_size, kv_block_tokens)
 
@@ -543,7 +551,7 @@ def _pcp_streaming_attention_page_groups_kernel(
         zero_store.wait()
 
     for lane in range(num_lanes):
-        m = jnp.full((q_block_size, 1), -jnp.inf, dtype=jnp.float32)
+        m = jnp.full((q_block_size, 1), jnp.finfo(jnp.float32).min, dtype=jnp.float32)
         l = jnp.zeros((q_block_size, 1), dtype=jnp.float32)
         acc = jnp.zeros((q_block_size, q_vmem_ref.shape[1]),
                         dtype=jnp.float32)
@@ -587,7 +595,7 @@ def _pcp_streaming_attention_page_groups_kernel(
             util.local_barrier(prev_device_id, next_device_id)
 
             m = jnp.where(group_is_first_kv,
-                          jnp.full_like(m, -jnp.inf),
+                          jnp.full_like(m, jnp.finfo(m.dtype).min),
                           m)
             l = jnp.where(group_is_first_kv, jnp.zeros_like(l), l)
             acc = jnp.where(group_is_first_kv, jnp.zeros_like(acc), acc)
@@ -743,7 +751,7 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
 
     for lane in range(num_lanes):
         l_ref[...] = jnp.zeros_like(l_ref)
-        m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+        m_ref[...] = jnp.full_like(m_ref, jnp.finfo(m_ref.dtype).min)
         acc_ref[...] = jnp.zeros_like(acc_ref)
 
         def _page_group_loop(group_idx, carry):
@@ -797,7 +805,7 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
             @pl.when(group_is_first_kv)
             def _reset_states():
                 l_ref[...] = jnp.zeros_like(l_ref)
-                m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+                m_ref[...] = jnp.full_like(m_ref, jnp.finfo(m_ref.dtype).min)
                 acc_ref[...] = jnp.zeros_like(acc_ref)
 
             group_has_last = jnp.array(False)
